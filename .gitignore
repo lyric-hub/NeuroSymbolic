@@ -29,8 +29,8 @@ calibration.yaml
 zone_config.json
 
 # ─── Model weights ────────────────────────────────────────────────────────────
-*.pt
-*.pth
+# *.pt
+# *.pth
 *.onnx
 *.engine
 *.trt
