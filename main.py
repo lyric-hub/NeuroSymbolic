@@ -116,11 +116,13 @@ def process_video(video_path: str, progress_callback=None):
         # THE MACRO-LOOP (Low-Frequency Semantics)
         # ==========================================
         
-        if frame_id % semantic_interval == 0 and len(tracked_boxes) > 0:
+        if frame_id > 0 and frame_id % semantic_interval == 0 and len(tracked_boxes) > 0:
             print(f"[{timestamp:.1f}s] Running Semantic Abstraction...")
             
-            # Define chunking window
-            chunk_start = max(0.0, timestamp - (semantic_interval/fps) - 2.0)
+            # Define chunking window — must match behavior_summary window_secs
+            # so the agent's physics lookups cover the same period the VLM reasoned about.
+            HISTORY_WINDOW_SECS = 5.0
+            chunk_start = max(0.0, timestamp - HISTORY_WINDOW_SECS)
             time_window_ptr = f"{chunk_start:.1f}-{timestamp:.1f}"
             
             # 1. Visual Grounding (Set-of-Mark)
