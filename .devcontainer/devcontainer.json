@@ -1,0 +1,35 @@
+{
+  "name": "NeuroSymbolic",
+  "image": "nvcr.io/nvidia/pytorch:25.11-py3",
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--shm-size",
+    "16g",
+    "--ipc=host",
+    "--ulimit",
+    "memlock=-1",
+    "--ulimit",
+    "stack=67108864"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.jupyter-keymap",
+        "ms-toolsai.jupyter-renderers",
+        "njpwerner.autodocstring",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "postCreateCommand": "apt-get update && apt-get install -y tmux nvtop git curl libmediainfo0v5 && git config --global --add safe.directory /workspace && git config --global user.name 'lyric-hub' && git config --global user.email 'csaju53@gmail.com' && pip install --upgrade pip && pip install -r requirements.txt"
+}
