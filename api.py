@@ -1,11 +1,13 @@
 import asyncio
 import shutil
 import uuid
+import cv2
+import numpy as np
 from enum import Enum
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -154,6 +156,89 @@ async def chat_with_agent(request: ChatRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stream")
+async def stream_video(
+    video: str = Query(..., description="Path to video file"),
+    tracker: str = Query("bytetrack", description="Tracker name"),
+    conf: float = Query(0.3, description="Detection confidence threshold"),
+    som: bool = Query(False, description="Use Set-of-Mark rendering instead of bounding boxes"),
+):
+    """
+    Streams a video with live detection and tracking overlaid as MJPEG.
+
+    Normal mode:  http://localhost:8000/stream?video=data/ulloor/your_file.mp4
+    SoM mode:     http://localhost:8000/stream?video=data/ulloor/your_file.mp4&som=true
+    """
+    from src.physics_engine.detector import load_detector
+    from src.physics_engine.tracker import VehicleTracker
+    from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext
+
+    video_path = Path(video)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail=f"Video not found: {video}")
+
+    rng = np.random.default_rng(42)
+    palette = rng.integers(80, 255, size=(256, 3)).tolist()
+
+    def _generate_frames():
+        detector = load_detector("models/best.pt", conf=conf)
+        vt       = VehicleTracker(tracker_name=tracker)
+        renderer = AdaptiveRenderer() if som else None
+        ctx      = RenderContext() if som else None
+        cap      = cv2.VideoCapture(str(video_path))
+        fps      = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_id = 0
+
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                raw_dets      = detector.predict(frame)
+                tracked_boxes = vt.update(raw_dets[0], frame)
+
+                if som:
+                    ctx.update(tracked_boxes, frame_id / fps)
+                    renderer.render(frame, ctx)
+                else:
+                    for box in tracked_boxes:
+                        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                        track_id = int(box[4])
+                        cls_id   = int(box[6]) if len(box) > 6 else 0
+                        conf_val = float(box[5]) if len(box) > 5 else 0.0
+
+                        colour   = palette[track_id % 256]
+                        cls_name = detector.model.names.get(cls_id, str(cls_id))
+                        label    = f"#{track_id} {cls_name} {conf_val:.2f}"
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+                        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), colour, -1)
+                        cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+                _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + jpeg.tobytes() + b"\r\n")
+                frame_id += 1
+        finally:
+            cap.release()
+
+    return StreamingResponse(
+        _generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/videos")
+async def list_videos():
+    """Lists available videos in data/."""
+    video_dir = Path("data")
+    videos = sorted(str(p) for p in video_dir.rglob("*.mp4"))
+    return {"videos": videos}
+
 
 @app.get("/health/")
 async def health_check():

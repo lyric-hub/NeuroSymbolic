@@ -124,75 +124,70 @@ class BaseRenderer:
 # ---------------------------------------------------------------------
 
 
+def _draw_som_badge(
+    frame: np.ndarray,
+    cx: int,
+    cy: int,
+    label: str,
+    font_scale: float = 0.55,
+) -> None:
+    """
+    Draw a high-contrast SoM badge (filled coloured box + white text) so that
+    VLMs can reliably read the track ID from the image.
+
+    A unique colour per ID is derived from the track ID so repeated badges are
+    visually distinguishable even in dense scenes.
+    """
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1
+    pad       = 3
+
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    # Deterministic per-ID colour (hue derived from ID, full saturation/value)
+    hue   = int(label) * 37 % 180          # spread IDs across hue wheel
+    hsv   = np.array([[[hue, 220, 200]]], dtype=np.uint8)
+    bgr   = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0].tolist()
+
+    # Centroid dot
+    cv2.circle(frame, (cx, cy), 4, bgr, -1)
+    cv2.circle(frame, (cx, cy), 4, (255, 255, 255), 1)
+
+    # Badge background
+    bx1, by1 = cx + 6, cy - th - pad * 2
+    bx2, by2 = cx + 6 + tw + pad * 2, cy
+    cv2.rectangle(frame, (bx1, by1), (bx2, by2), bgr, -1)
+    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+
+    # White text on coloured badge
+    cv2.putText(
+        frame, label,
+        (bx1 + pad, by2 - pad),
+        font, font_scale,
+        (255, 255, 255), thickness, cv2.LINE_AA,
+    )
+
+
 class UltraMinimalRenderer(BaseRenderer):
     """
-    Renders minimal SoM markers for dense scenes.
+    Renders SoM badges for dense scenes.
 
     Design:
-    - Small centroid dot
-    - Thin ID label
-    - Neutral grayscale
-    - No bounding boxes
+    - Coloured filled badge with white text for VLM readability
+    - Centroid dot with white outline
+    - No bounding boxes (minimises visual clutter)
     """
 
-    def __init__(self, font_scale: float = 0.4) -> None:
-        """
-        Initializes the ultra-minimal renderer.
-
-        Args:
-            font_scale (float): Font size for ID labels.
-        """
+    def __init__(self, font_scale: float = 0.55) -> None:
         self.font_scale = font_scale
 
     def render(self, frame: np.ndarray, context: RenderContext) -> None:
-        """
-        Render ultra-minimal markers.
-
-        Args:
-            frame (np.ndarray): BGR image frame.
-            context (RenderContext): Overlays to draw.
-        """
         for track in context.tracks:
             self._draw_track(frame, track)
 
     def _draw_track(self, frame: np.ndarray, track: TrackState) -> None:
-        """
-        Draw a single track marker.
-
-        Args:
-            frame (np.ndarray): The image frame.
-            track (TrackState): The individual state to draw.
-        """
-        color = (200, 200, 200)  # soft gray
         cx, cy = track.center
-        label = str(track.track_id)
-
-        # centroid dot
-        cv2.circle(frame, (cx, cy), 2, color, -1)
-
-        # halo for contrast
-        cv2.putText(
-            frame,
-            label,
-            (cx + 4, cy - 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            self.font_scale,
-            (0, 0, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-        # main label
-        cv2.putText(
-            frame,
-            label,
-            (cx + 4, cy - 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            self.font_scale,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        _draw_som_badge(frame, cx, cy, str(track.track_id), self.font_scale)
 
 
 # ---------------------------------------------------------------------
@@ -244,25 +239,18 @@ class AdaptiveRenderer(BaseRenderer):
         for track in context.tracks:
             x1, y1, x2, y2 = track.box
             cx, cy = track.center
-            color = (180, 180, 180)
-            tick = 6
 
-            # centroid
-            cv2.circle(frame, (cx, cy), 2, color, -1)
+            # Derive per-ID colour (same palette as badge)
+            hue   = int(track.track_id) * 37 % 180
+            hsv   = np.array([[[hue, 220, 200]]], dtype=np.uint8)
+            color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0].tolist()
+            tick  = 8
 
-            # corner ticks (thin)
-            cv2.line(frame, (x1, y1), (x1 + tick, y1), color, 1)
-            cv2.line(frame, (x1, y1), (x1, y1 + tick), color, 1)
-            cv2.line(frame, (x2, y1), (x2 - tick, y1), color, 1)
-            cv2.line(frame, (x2, y1), (x2, y1 + tick), color, 1)
+            # Corner ticks in matching colour
+            cv2.line(frame, (x1, y1), (x1 + tick, y1), color, 2)
+            cv2.line(frame, (x1, y1), (x1, y1 + tick), color, 2)
+            cv2.line(frame, (x2, y1), (x2 - tick, y1), color, 2)
+            cv2.line(frame, (x2, y1), (x2, y1 + tick), color, 2)
 
-            cv2.putText(
-                frame,
-                str(track.track_id),
-                (cx + 4, cy - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            # High-contrast SoM badge
+            _draw_som_badge(frame, cx, cy, str(track.track_id))

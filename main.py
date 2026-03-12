@@ -132,12 +132,19 @@ def process_video(video_path: str, progress_callback=None):
             # Convert to PIL Image for the VLM
             som_pil = Image.fromarray(cv2.cvtColor(som_frame, cv2.COLOR_BGR2RGB))
             
-            # 2. VLM Inference
-            # state_vectors passed here so the VLM receives real-world position,
-            # speed, and acceleration — giving it spatial and motion awareness
-            # that cannot be derived from a single frozen frame.
+            # 2. Build behaviour history summary from DuckDB (last 5s, changes only)
+            # This replaces the single-frame snapshot with a compact narrative of
+            # each vehicle's recent behaviour — stationary→braking→moving etc.
+            active_ids = [int(t[4]) for t in tracked_boxes]
+            behavior_summary = duckdb_client.get_behavior_summary(active_ids, timestamp)
+
+            # 3. VLM Inference
+            # behavior_summary gives the VLM change-only motion history;
+            # state_vectors kept as fallback for the first few frames before
+            # DuckDB has enough data to summarise.
             vlm_triples = vlm.generate_scene_graph_triples(
-                som_pil, timestamp, state_vectors, kinematics.warm_tracks
+                som_pil, timestamp, state_vectors, kinematics.warm_tracks,
+                behavior_summary=behavior_summary,
             )
             
             if vlm_triples:

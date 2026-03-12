@@ -98,6 +98,48 @@ ollama pull qwen2.5:72b
 
 ---
 
+## Quick Start — Live Detection & Tracking Stream
+
+### 1. Start Ollama (if not already running)
+```bash
+ollama serve &
+```
+
+### 2. Start the API server
+```bash
+cd /workspace
+uvicorn api:app --host 0.0.0.0 --port 8000 &
+```
+
+### 3. Forward port 8000 (DevContainer only)
+In VSCode: `Ctrl+Shift+P` → **Forward a Port** → `8000`
+
+### 4. Open the live stream in your browser
+```
+http://localhost:8000/stream?video=data/ulloor/20250523_162245_tp00026.mp4
+```
+
+Switch videos or trackers via query params:
+```
+http://localhost:8000/stream?video=data/ulloor/20250523_154828_tp00025.mp4&tracker=ocsort
+http://localhost:8000/stream?video=data/ulloor/20250523_165701_tp00027.mp4&tracker=botsort&conf=0.4
+```
+
+| Param | Default | Options |
+|-------|---------|---------|
+| `video` | required | any path from `GET /videos` |
+| `tracker` | `bytetrack` | `bytetrack`, `ocsort`, `sfsort`, `botsort`, `deepocsort`, `hybridsort`, `boosttrack`, `strongsort` |
+| `conf` | `0.3` | 0.0 – 1.0 |
+
+List all available videos: `http://localhost:8000/videos`
+
+### 5. Stop the server
+```bash
+kill -9 $(pgrep -f "uvicorn api:app")
+```
+
+---
+
 ## End-to-End Testing Guide
 
 ### Step 1 — Place a test video

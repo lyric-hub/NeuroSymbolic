@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import yaml  # type: ignore
 from boxmot import TRACKERS, create_tracker  # type: ignore
-from boxmot.utils import TRACKER_CONFIGS  # type: ignore
+from boxmot.utils import TRACKER_CONFIGS, WEIGHTS as BOXMOT_WEIGHTS  # type: ignore
 
 from src.utils import get_device
 
@@ -29,7 +29,22 @@ _APPEARANCE_TRACKERS = {
     "imprassoc",
 }
 
-_DEFAULT_REID = os.getenv("BOXMOT_DEFAULT_REID", "osnet_x0_25_msmt17.pt")
+_REID_FILENAME = "osnet_x0_25_msmt17.pt"
+
+def _resolve_default_reid() -> str:
+    """
+    Resolves the default ReID weights path.
+
+    Priority:
+    1. BOXMOT_DEFAULT_REID env var (explicit override)
+    2. BoxMOT's own weights directory (portable, auto-downloads on first use)
+    """
+    env_override = os.getenv("BOXMOT_DEFAULT_REID")
+    if env_override:
+        return env_override
+    return str(BOXMOT_WEIGHTS / _REID_FILENAME)
+
+_DEFAULT_REID = _resolve_default_reid()
 
 
 def _resolve_device_str(device_arg: DeviceArg = None) -> str:

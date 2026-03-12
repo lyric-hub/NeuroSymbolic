@@ -18,9 +18,9 @@ class DuckDBClient:
         self.conn = duckdb.connect(self.db_path)
         self._initialize_schema()
 
-        # Persistent appender: stays open for the lifetime of the pipeline.
-        # Avoids the open/flush/close overhead on every single frame.
-        self._appender = self.conn.appender("vehicle_trajectories")
+        # Row buffer: accumulate rows and flush in bulk every N frames.
+        # DuckDB 1.x removed the Appender class; executemany is the equivalent.
+        self._buffer: list = []
         self._frames_since_flush = 0
 
     def _initialize_schema(self) -> None:
@@ -80,16 +80,25 @@ class DuckDBClient:
             return
 
         for track_id, sv in state_vectors.items():
-            # sv corresponds to [pos_x, pos_y, vel_x, vel_y, accel_x, accel_y]
-            self._appender.append_row(
+            self._buffer.append((
                 timestamp, frame_id, track_id,
                 sv[0], sv[1], sv[2], sv[3], sv[4], sv[5]
-            )
+            ))
 
         self._frames_since_flush += 1
         if self._frames_since_flush >= FLUSH_EVERY_N_FRAMES:
-            self._appender.flush()
-            self._frames_since_flush = 0
+            self._flush()
+
+    def _flush(self) -> None:
+        """Bulk-inserts buffered rows and clears the buffer."""
+        if not self._buffer:
+            return
+        self.conn.executemany(
+            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?)",
+            self._buffer,
+        )
+        self._buffer.clear()
+        self._frames_since_flush = 0
 
     def get_trajectory_window(self, start_time: float, end_time: float, track_id: int):
         """
@@ -107,6 +116,99 @@ class DuckDBClient:
         """
         # Returns a pandas dataframe for easy analytical processing by the agent
         return self.conn.execute(query, (track_id, start_time, end_time)).df()
+
+    def get_behavior_summary(
+        self,
+        track_ids: List[int],
+        current_time: float,
+        window_secs: float = 5.0,
+    ) -> str:
+        """
+        Queries the last ``window_secs`` of trajectory data for each track and
+        returns a compact, change-only narrative — not raw rows.
+
+        Algorithm:
+        1. Classify each row into a behaviour state (STOPPED/BRAKING/COASTING/ACCELERATING).
+        2. Run-length encode consecutive identical states (removes repetition).
+        3. Build one human-readable sentence per vehicle.
+
+        Args:
+            track_ids:    Vehicle IDs visible in the current frame.
+            current_time: Timestamp of the current frame (seconds).
+            window_secs:  How far back to look (default 5 s).
+
+        Returns:
+            Multi-line string ready to inject into the VLM prompt.
+        """
+        if not track_ids:
+            return ""
+
+        # Flush the buffer so the current frame's data is visible to the query.
+        # Without this, rows written since the last periodic flush are invisible.
+        self._flush()
+
+        start_time = max(0.0, current_time - window_secs)
+        lines = []
+
+        for tid in sorted(track_ids):
+            df = self.get_trajectory_window(start_time, current_time, tid)
+            if df.empty:
+                lines.append(f"  Vehicle {tid}: no history yet (just appeared)")
+                continue
+
+            # Compute scalar speed and signed acceleration
+            df = df.copy()
+            df["speed"]       = (df["vel_x"]**2   + df["vel_y"]**2  ).pow(0.5)
+            df["accel_mag"]   = (df["accel_x"]**2 + df["accel_y"]**2).pow(0.5)
+            dot               = df["vel_x"]*df["accel_x"] + df["vel_y"]*df["accel_y"]
+            df["signed_accel"] = df["accel_mag"].where(dot >= 0, -df["accel_mag"])
+
+            # Classify each row into a behaviour label
+            def _label(row):
+                if row["speed"] < 0.5:
+                    return "STOPPED"
+                if row["signed_accel"] < -2.0:
+                    return "BRAKING"
+                if row["signed_accel"] > 1.5:
+                    return "ACCELERATING"
+                return "MOVING"
+
+            df["state"] = df.apply(_label, axis=1)
+
+            # Run-length encode — only keep state transitions
+            segments = []
+            prev_state, seg_start = None, df["timestamp"].iloc[0]
+            for _, row in df.iterrows():
+                if row["state"] != prev_state:
+                    if prev_state is not None:
+                        segments.append((prev_state, seg_start, row["timestamp"]))
+                    prev_state, seg_start = row["state"], row["timestamp"]
+            segments.append((prev_state, seg_start, df["timestamp"].iloc[-1]))
+
+            # Build narrative from segments (skip single-frame blips < 0.2s)
+            parts = []
+            for state, t0, t1 in segments:
+                dur = t1 - t0
+                if dur < 0.5 and len(segments) > 1:
+                    continue
+                label_map = {
+                    "STOPPED":      f"stationary for {dur:.1f}s",
+                    "BRAKING":      f"braking for {dur:.1f}s",
+                    "ACCELERATING": f"accelerating for {dur:.1f}s",
+                    "MOVING":       f"moving for {dur:.1f}s",
+                }
+                parts.append(label_map[state])
+
+            # Append current speed/accel at the last row
+            last = df.iloc[-1]
+            current_str = (
+                f"now: speed={last['speed']:.1f} m/s, "
+                f"accel={last['signed_accel']:+.1f} m/s²"
+            )
+            narrative = " → ".join(parts) + f" | {current_str}"
+            lines.append(f"  Vehicle {tid}: {narrative}")
+
+        return "\n".join(lines)
 
     def insert_crossing_event(self, event) -> None:
         """
@@ -232,6 +334,5 @@ class DuckDBClient:
 
     def close(self) -> None:
         """Flushes any remaining buffered rows and closes the database connection."""
-        self._appender.flush()
-        self._appender.close()
+        self._flush()
         self.conn.close()

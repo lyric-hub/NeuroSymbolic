@@ -81,6 +81,7 @@ class TrafficSemanticAbstractor:
         timestamp: float,
         state_vectors: Dict[int, List[float]] = None,
         warm_tracks: Set[int] = None,
+        behavior_summary: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Takes an image with tracking ID overlays and prompts the VLM to extract interactions.
@@ -102,9 +103,19 @@ class TrafficSemanticAbstractor:
         Returns:
             A list of dictionaries representing SPO triples (e.g., Subject, Predicate, Object).
         """
-        # Build optional physics context block
+        # Build physics context block.
+        # If a pre-computed behavior_summary is provided, use that — it contains
+        # change-only narratives from DuckDB history (much richer than a snapshot).
+        # Fall back to the current-frame snapshot when no history is available.
         physics_block = ""
-        if state_vectors:
+        if behavior_summary:
+            physics_block = (
+                "\nVerified vehicle behaviour history (last 5 s) from the tracking engine "
+                "(use this to ground your analysis — do not contradict it):\n"
+                + behavior_summary
+                + "\n"
+            )
+        elif state_vectors:
             physics_block = (
                 "\nVerified physics data from the tracking engine "
                 "(use this to ground your analysis — do not contradict it):\n"
@@ -112,10 +123,18 @@ class TrafficSemanticAbstractor:
                 + "\n"
             )
 
+        # Build active track ID constraint so VLM only references real tracked IDs
+        active_ids = sorted(state_vectors.keys()) if state_vectors else []
+        id_constraint = (
+            f"The ONLY valid vehicle IDs in this frame are: {active_ids}. "
+            "Use ONLY these exact IDs when referring to vehicles (e.g. 'Vehicle 14', not 'Vehicle 1'). "
+        ) if active_ids else ""
+
         # The prompt forces the VLM to act as a structured data extractor
         system_prompt = (
             "You are an expert autonomous driving and traffic safety analyst. "
             "Analyze the provided traffic camera image. Vehicles have been marked with numerical IDs. "
+            + id_constraint
             + physics_block +
             "Identify all safety-critical interactions and spatial relationships between "
             "the marked vehicles, pedestrians, and the environment. "

@@ -11,6 +11,7 @@ torch
 torchvision
 pillow
 pydantic
+accelerate 
 
 duckdb
 kuzu
