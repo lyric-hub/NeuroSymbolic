@@ -31,5 +31,5 @@
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "remoteUser": "root",
-  "postCreateCommand": "apt-get update && apt-get install -y tmux nvtop git curl libmediainfo0v5 && git config --global --add safe.directory /workspace && git config --global user.name 'lyric-hub' && git config --global user.email 'csaju53@gmail.com' && pip install --upgrade pip && pip install -r requirements.txt"
+  "postCreateCommand": "apt-get update && apt-get install -y tmux nvtop  zstd git curl libmediainfo0v5 && git config --global --add safe.directory /workspace && git config --global user.name 'lyric-hub' && git config --global user.email 'csaju53@gmail.com' && pip install --upgrade pip && pip install -r requirements.txt"
 }

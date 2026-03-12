@@ -23,6 +23,7 @@ data/raw_videos/
 data/duckdb_storage/
 data/milvus_storage/
 data/graph_storage/
+data/ullooor/
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
 calibration.yaml
@@ -55,3 +56,7 @@ secrets.json
 # ─── Logs & temp ──────────────────────────────────────────────────────────────
 *.log
 *.tmp
+
+# ─── Misc ───────────────────────────────────────────────────────────────────
+
+*.mp4
