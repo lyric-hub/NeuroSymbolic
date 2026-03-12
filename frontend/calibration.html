@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrafficAgent — Camera Calibration</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        /* ── Calibration-page overrides ── */
+        body { overflow: auto; }
+
+        .calib-layout {
+            display: grid;
+            grid-template-columns: 1fr 360px;
+            gap: 20px;
+            padding: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+            min-height: 100vh;
+        }
+
+        /* ── Canvas panel ── */
+        .canvas-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .canvas-wrap {
+            position: relative;
+            background: #000;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            overflow: hidden;
+            cursor: crosshair;
+            min-height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #calibCanvas {
+            display: block;
+            max-width: 100%;
+            max-height: 65vh;
+        }
+
+        .canvas-placeholder {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            text-align: center;
+            padding: 40px;
+        }
+
+        /* ── Frame scrubber ── */
+        .scrubber-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .scrubber-row input[type=range] {
+            flex: 1;
+            accent-color: var(--accent);
+            height: 4px;
+        }
+
+        .frame-counter {
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            min-width: 90px;
+            text-align: right;
+        }
+
+        .scrubber-btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-xs);
+            color: var(--text-primary);
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: border-color var(--transition-fast);
+        }
+        .scrubber-btn:hover { border-color: var(--accent); }
+
+        /* ── Control panel ── */
+        .control-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .panel-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            padding: 18px;
+        }
+
+        .panel-card h3 {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 14px;
+        }
+
+        /* ── Video selector ── */
+        select {
+            width: 100%;
+            background: var(--bg-input);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-xs);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            font-family: var(--font-body);
+            font-size: 0.875rem;
+            cursor: pointer;
+            outline: none;
+            transition: border-color var(--transition-fast);
+        }
+        select:focus { border-color: var(--accent); }
+
+        /* ── Points table ── */
+        .points-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }
+
+        .points-table th {
+            text-align: left;
+            color: var(--text-muted);
+            font-weight: 500;
+            padding: 4px 6px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .points-table td {
+            padding: 5px 6px;
+            vertical-align: middle;
+        }
+
+        .point-idx {
+            font-family: var(--font-mono);
+            color: var(--accent);
+            font-weight: 600;
+            width: 24px;
+        }
+
+        .coord-cell {
+            font-family: var(--font-mono);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        .world-input {
+            width: 64px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-subtle);
+            border-radius: 4px;
+            color: var(--text-primary);
+            padding: 3px 6px;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            text-align: right;
+            outline: none;
+            transition: border-color var(--transition-fast);
+        }
+        .world-input:focus { border-color: var(--accent); }
+
+        .delete-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            transition: color var(--transition-fast);
+        }
+        .delete-btn:hover { color: var(--error); }
+
+        .no-points {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            text-align: center;
+            padding: 12px 0;
+        }
+
+        /* ── Action buttons ── */
+        .btn-primary {
+            width: 100%;
+            padding: 10px;
+            background: var(--accent-gradient);
+            border: none;
+            border-radius: var(--radius-sm);
+            color: #000;
+            font-weight: 600;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: opacity var(--transition-fast);
+        }
+        .btn-primary:hover { opacity: 0.88; }
+        .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+        .btn-secondary {
+            width: 100%;
+            padding: 8px;
+            background: transparent;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: border-color var(--transition-fast), color var(--transition-fast);
+        }
+        .btn-secondary:hover { border-color: var(--accent); color: var(--text-primary); }
+
+        /* ── Results panel ── */
+        .rmse-display {
+            text-align: center;
+            padding: 10px 0;
+        }
+
+        .rmse-value {
+            font-family: var(--font-mono);
+            font-size: 1.6rem;
+            font-weight: 600;
+        }
+        .rmse-good  { color: var(--success); }
+        .rmse-ok    { color: var(--warning); }
+        .rmse-bad   { color: var(--error); }
+
+        .rmse-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .error-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.75rem;
+            font-family: var(--font-mono);
+        }
+        .error-table th {
+            color: var(--text-muted);
+            text-align: left;
+            padding: 3px 5px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        .error-table td {
+            padding: 4px 5px;
+            color: var(--text-secondary);
+        }
+        .error-table td:last-child { text-align: right; }
+
+        /* ── Status badge ── */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.78rem;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 500;
+        }
+        .status-badge.calibrated   { background: rgba(0,230,138,0.12); color: var(--success); }
+        .status-badge.uncalibrated { background: rgba(255,92,108,0.12); color: var(--error); }
+        .status-dot-sm {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        /* ── Toast ── */
+        #toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            padding: 12px 18px;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            opacity: 0;
+            transform: translateY(8px);
+            transition: opacity 0.25s, transform 0.25s;
+            z-index: 100;
+            pointer-events: none;
+            max-width: 320px;
+        }
+        #toast.show { opacity: 1; transform: translateY(0); }
+        #toast.success { border-color: var(--success); }
+        #toast.error   { border-color: var(--error); }
+
+        /* ── Back link ── */
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            text-decoration: none;
+            margin-bottom: 4px;
+            transition: color var(--transition-fast);
+        }
+        .back-link:hover { color: var(--accent); }
+
+        .page-heading {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+
+        .hint {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+<div class="calib-layout">
+
+    <!-- ═══════════════════════════════
+         LEFT — Canvas + Scrubber
+    ════════════════════════════════ -->
+    <div class="canvas-panel">
+        <div>
+            <a href="/" class="back-link">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                Back to Dashboard
+            </a>
+            <h1 class="page-heading">Camera Calibration</h1>
+        </div>
+
+        <div class="canvas-wrap" id="canvasWrap">
+            <div class="canvas-placeholder" id="canvasPlaceholder">
+                Select a video to begin.<br>Then click the frame to place calibration points.
+            </div>
+            <canvas id="calibCanvas" style="display:none;"></canvas>
+        </div>
+
+        <div class="scrubber-row">
+            <button class="scrubber-btn" id="prevBtn">&#9664;</button>
+            <input type="range" id="frameScrubber" min="0" max="0" value="0" disabled>
+            <button class="scrubber-btn" id="nextBtn">&#9654;</button>
+            <span class="frame-counter" id="frameCounter">— / —</span>
+        </div>
+
+        <p class="hint">
+            Click on the frame to place a point. Enter the corresponding real-world
+            ground coordinates (in metres) in the table on the right.
+            You need at least <strong>4 non-collinear</strong> points for a valid calibration.
+            After computing, reprojected points are shown in red on the frame.
+        </p>
+    </div>
+
+    <!-- ═══════════════════════════════
+         RIGHT — Controls
+    ════════════════════════════════ -->
+    <div class="control-panel">
+
+        <!-- Calibration status -->
+        <div class="panel-card" style="padding: 12px 18px;">
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:0.8rem; color:var(--text-muted);">Current status</span>
+                <span class="status-badge uncalibrated" id="statusBadge">
+                    <span class="status-dot-sm"></span>
+                    <span id="statusText">Not calibrated</span>
+                </span>
+            </div>
+            <div id="statusDetail" style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;"></div>
+        </div>
+
+        <!-- Video selector -->
+        <div class="panel-card">
+            <h3>Video Source</h3>
+            <select id="videoSelect">
+                <option value="">Loading videos...</option>
+            </select>
+        </div>
+
+        <!-- Points table -->
+        <div class="panel-card" style="flex:1;">
+            <h3>Calibration Points <span id="pointCount" style="color:var(--accent);">(0)</span></h3>
+            <table class="points-table">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Pixel (x, y)</th>
+                        <th>World X (m)</th>
+                        <th>World Y (m)</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="pointsBody">
+                    <tr><td colspan="5" class="no-points">No points placed yet.</td></tr>
+                </tbody>
+            </table>
+            <button class="btn-secondary" id="clearBtn" style="margin-top:12px;">Clear all points</button>
+        </div>
+
+        <!-- Compute -->
+        <div class="panel-card">
+            <h3>Compute Homography</h3>
+            <button class="btn-primary" id="computeBtn" disabled>Compute &amp; Save</button>
+        </div>
+
+        <!-- Results -->
+        <div class="panel-card" id="resultsCard" style="display:none;">
+            <h3>Reprojection Results</h3>
+            <div class="rmse-display">
+                <div class="rmse-value" id="rmseValue">—</div>
+                <div class="rmse-label">RMSE (metres)</div>
+            </div>
+            <table class="error-table" id="errorTable">
+                <thead>
+                    <tr><th>Pt</th><th>Proj X</th><th>Proj Y</th><th>Error (m)</th></tr>
+                </thead>
+                <tbody id="errorBody"></tbody>
+            </table>
+        </div>
+
+    </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════
+const state = {
+    videoFile: null,
+    totalFrames: 0,
+    frameIdx: 0,
+    imageW: 0,
+    imageH: 0,
+    points: [],          // [{pixelX, pixelY, worldX, worldY}]
+    projectedPts: [],    // [{projectedX, projectedY}] from last compute
+    scrubTimeout: null,
+};
+
+// ═══════════════════════════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════════════════════════
+const canvas        = document.getElementById("calibCanvas");
+const ctx           = canvas.getContext("2d");
+const placeholder   = document.getElementById("canvasPlaceholder");
+const scrubber      = document.getElementById("frameScrubber");
+const frameCounter  = document.getElementById("frameCounter");
+const videoSelect   = document.getElementById("videoSelect");
+const pointsBody    = document.getElementById("pointsBody");
+const pointCount    = document.getElementById("pointCount");
+const computeBtn    = document.getElementById("computeBtn");
+const clearBtn      = document.getElementById("clearBtn");
+const resultsCard   = document.getElementById("resultsCard");
+const rmseValue     = document.getElementById("rmseValue");
+const errorBody     = document.getElementById("errorBody");
+const statusBadge   = document.getElementById("statusBadge");
+const statusText    = document.getElementById("statusText");
+const statusDetail  = document.getElementById("statusDetail");
+const prevBtn       = document.getElementById("prevBtn");
+const nextBtn       = document.getElementById("nextBtn");
+
+// ═══════════════════════════════════════════════════════════
+// Toast helper
+// ═══════════════════════════════════════════════════════════
+function toast(msg, type = "info") {
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.className = `show ${type}`;
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.className = "", 3500);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Init: load video list + calibration status
+// ═══════════════════════════════════════════════════════════
+async function init() {
+    await Promise.all([loadVideos(), loadStatus()]);
+}
+
+async function loadVideos() {
+    const res = await fetch("/calibrate/videos");
+    const { videos } = await res.json();
+    videoSelect.innerHTML = videos.length
+        ? `<option value="">— select a video —</option>` + videos.map(v => `<option value="${v}">${v}</option>`).join("")
+        : `<option value="">No videos found in data/raw_videos/</option>`;
+}
+
+async function loadStatus() {
+    const res = await fetch("/calibrate/status");
+    const data = await res.json();
+    if (data.calibrated) {
+        statusBadge.className = "status-badge calibrated";
+        statusText.textContent = "Calibrated";
+        const d = data.detail;
+        statusDetail.textContent = d
+            ? `${d.num_points} pts · RMSE ${d.rmse_meters}m · ${d.video_path ?? ""} fr.${d.frame_idx ?? ""}`
+            : "";
+    } else {
+        statusBadge.className = "status-badge uncalibrated";
+        statusText.textContent = "Not calibrated";
+        statusDetail.textContent = "";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Frame loading
+// ═══════════════════════════════════════════════════════════
+async function loadFrame(idx) {
+    if (!state.videoFile) return;
+    const res = await fetch(`/calibrate/frame?video_path=${encodeURIComponent(state.videoFile)}&frame_idx=${idx}`);
+    if (!res.ok) { toast("Failed to load frame.", "error"); return; }
+    const data = await res.json();
+
+    state.totalFrames = data.total_frames;
+    state.frameIdx    = data.frame_idx;
+    state.imageW      = data.width;
+    state.imageH      = data.height;
+
+    scrubber.max   = data.total_frames - 1;
+    scrubber.value = data.frame_idx;
+    frameCounter.textContent = `${data.frame_idx} / ${data.total_frames - 1}`;
+
+    const img = new Image();
+    img.onload = () => {
+        canvas.width  = data.width;
+        canvas.height = data.height;
+        placeholder.style.display = "none";
+        canvas.style.display = "block";
+        redraw(img);
+        state._lastImg = img;
+    };
+    img.src = `data:image/jpeg;base64,${data.frame_b64}`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Canvas drawing
+// ═══════════════════════════════════════════════════════════
+function redraw(img) {
+    const image = img || state._lastImg;
+    if (!image) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(image, 0, 0);
+
+    // Draw placed points
+    state.points.forEach((pt, i) => {
+        // Crosshair
+        ctx.strokeStyle = "#00c8ff";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(pt.pixelX - 10, pt.pixelY);
+        ctx.lineTo(pt.pixelX + 10, pt.pixelY);
+        ctx.moveTo(pt.pixelX, pt.pixelY - 10);
+        ctx.lineTo(pt.pixelX, pt.pixelY + 10);
+        ctx.stroke();
+
+        // Circle
+        ctx.strokeStyle = "#00c8ff";
+        ctx.beginPath();
+        ctx.arc(pt.pixelX, pt.pixelY, 6, 0, 2 * Math.PI);
+        ctx.stroke();
+
+        // Label
+        ctx.fillStyle = "#00c8ff";
+        ctx.font = "bold 13px 'JetBrains Mono', monospace";
+        ctx.fillText(i + 1, pt.pixelX + 9, pt.pixelY - 6);
+    });
+
+    // Draw reprojected points (from last compute)
+    state.projectedPts.forEach((pt, i) => {
+        ctx.strokeStyle = "#ff5c6c";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(pt.projectedX, pt.projectedY, 5, 0, 2 * Math.PI);
+        ctx.stroke();
+
+        ctx.fillStyle = "#ff5c6c";
+        ctx.font = "11px 'JetBrains Mono', monospace";
+        ctx.fillText(`R${i + 1}`, pt.projectedX + 7, pt.projectedY + 4);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+// Canvas click → place point
+// ═══════════════════════════════════════════════════════════
+canvas.addEventListener("click", (e) => {
+    const rect  = canvas.getBoundingClientRect();
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const px = (e.clientX - rect.left)  * scaleX;
+    const py = (e.clientY - rect.top)   * scaleY;
+
+    state.points.push({ pixelX: px, pixelY: py, worldX: "", worldY: "" });
+    state.projectedPts = [];   // clear stale reprojections
+    renderTable();
+    redraw();
+});
+
+// ═══════════════════════════════════════════════════════════
+// Points table
+// ═══════════════════════════════════════════════════════════
+function renderTable() {
+    pointCount.textContent = `(${state.points.length})`;
+    computeBtn.disabled = state.points.length < 4;
+
+    if (state.points.length === 0) {
+        pointsBody.innerHTML = `<tr><td colspan="5" class="no-points">No points placed yet.</td></tr>`;
+        return;
+    }
+
+    pointsBody.innerHTML = state.points.map((pt, i) => `
+        <tr>
+            <td class="point-idx">${i + 1}</td>
+            <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
+            <td>
+                <input class="world-input" type="number" step="0.1"
+                    value="${pt.worldX}" placeholder="0.0"
+                    data-idx="${i}" data-axis="worldX">
+            </td>
+            <td>
+                <input class="world-input" type="number" step="0.1"
+                    value="${pt.worldY}" placeholder="0.0"
+                    data-idx="${i}" data-axis="worldY">
+            </td>
+            <td>
+                <button class="delete-btn" data-idx="${i}" title="Remove point">✕</button>
+            </td>
+        </tr>
+    `).join("");
+
+    // World coord inputs
+    pointsBody.querySelectorAll(".world-input").forEach(input => {
+        input.addEventListener("change", (e) => {
+            const idx  = parseInt(e.target.dataset.idx);
+            const axis = e.target.dataset.axis;
+            state.points[idx][axis] = parseFloat(e.target.value) || 0;
+        });
+    });
+
+    // Delete buttons
+    pointsBody.querySelectorAll(".delete-btn").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            const idx = parseInt(e.target.dataset.idx);
+            state.points.splice(idx, 1);
+            state.projectedPts = [];
+            renderTable();
+            redraw();
+        });
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+// Compute
+// ═══════════════════════════════════════════════════════════
+computeBtn.addEventListener("click", async () => {
+    // Validate all world coords are filled
+    const missing = state.points.some(p => p.worldX === "" || p.worldY === "");
+    if (missing) { toast("Please fill in all real-world coordinates.", "error"); return; }
+
+    computeBtn.disabled = true;
+    computeBtn.textContent = "Computing...";
+
+    const payload = {
+        video_path: state.videoFile,
+        frame_idx:  state.frameIdx,
+        point_pairs: state.points.map(p => ({
+            pixel_x: p.pixelX, pixel_y: p.pixelY,
+            world_x: p.worldX, world_y: p.worldY,
+        })),
+    };
+
+    try {
+        const res = await fetch("/calibrate/compute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) { toast(data.detail || "Compute failed.", "error"); return; }
+
+        // Show results panel
+        resultsCard.style.display = "block";
+        const rmse = data.rmse;
+        rmseValue.textContent = rmse.toFixed(4);
+        rmseValue.className = `rmse-value ${rmse < 0.3 ? "rmse-good" : rmse < 0.8 ? "rmse-ok" : "rmse-bad"}`;
+
+        errorBody.innerHTML = data.point_errors.map(e => `
+            <tr>
+                <td>${e.index + 1}</td>
+                <td>${e.projected_x.toFixed(2)}</td>
+                <td>${e.projected_y.toFixed(2)}</td>
+                <td style="color:${e.error_px < 0.3 ? "var(--success)" : e.error_px < 0.8 ? "var(--warning)" : "var(--error)"}">
+                    ${e.error_px.toFixed(4)}
+                </td>
+            </tr>
+        `).join("");
+
+        // Store projected points for canvas overlay
+        // Note: projected coords are in world space (metres), not pixel space.
+        // We do NOT draw them on the canvas since they're in a different coordinate system.
+        // Instead we just show the numeric errors in the table.
+        state.projectedPts = [];
+
+        toast(`Saved! RMSE = ${rmse.toFixed(4)} m`, "success");
+        await loadStatus();
+
+    } catch (err) {
+        toast("Network error during compute.", "error");
+    } finally {
+        computeBtn.disabled = false;
+        computeBtn.textContent = "Compute & Save";
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+// Video selector
+// ═══════════════════════════════════════════════════════════
+videoSelect.addEventListener("change", async (e) => {
+    state.videoFile = e.target.value || null;
+    state.points = [];
+    state.projectedPts = [];
+    resultsCard.style.display = "none";
+    renderTable();
+    if (state.videoFile) {
+        scrubber.disabled = false;
+        await loadFrame(0);
+    } else {
+        placeholder.style.display = "block";
+        canvas.style.display = "none";
+        scrubber.disabled = true;
+        frameCounter.textContent = "— / —";
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+// Frame scrubber
+// ═══════════════════════════════════════════════════════════
+scrubber.addEventListener("input", () => {
+    frameCounter.textContent = `${scrubber.value} / ${state.totalFrames - 1}`;
+    clearTimeout(state.scrubTimeout);
+    state.scrubTimeout = setTimeout(() => loadFrame(parseInt(scrubber.value)), 200);
+});
+
+prevBtn.addEventListener("click", () => {
+    if (!state.videoFile) return;
+    const next = Math.max(0, state.frameIdx - 30);
+    scrubber.value = next;
+    loadFrame(next);
+});
+
+nextBtn.addEventListener("click", () => {
+    if (!state.videoFile) return;
+    const next = Math.min(state.totalFrames - 1, state.frameIdx + 30);
+    scrubber.value = next;
+    loadFrame(next);
+});
+
+// ═══════════════════════════════════════════════════════════
+// Clear
+// ═══════════════════════════════════════════════════════════
+clearBtn.addEventListener("click", () => {
+    state.points = [];
+    state.projectedPts = [];
+    resultsCard.style.display = "none";
+    renderTable();
+    redraw();
+});
+
+// ═══════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════
+init();
+</script>
+</body>
+</html>

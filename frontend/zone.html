@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zone Editor — TrafficAgent</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3e;
+    --accent: #6c63ff; --accent2: #00d4aa; --warn: #f59e0b; --danger: #ef4444;
+    --text: #e2e8f0; --muted: #64748b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; font-size: 14px; }
+  nav { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
+  nav .logo { font-weight: 700; font-size: 16px; color: var(--accent); }
+  nav a { color: var(--muted); text-decoration: none; }
+  nav a:hover { color: var(--text); }
+  .layout { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 49px); }
+  .panel { background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 4px; }
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+  select, input[type=text], input[type=number], input[type=range] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 10px; border-radius: 6px; font-size: 13px;
+  }
+  input[type=range] { padding: 0; }
+  button {
+    padding: 8px 14px; border-radius: 6px; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 600; transition: opacity .15s;
+  }
+  button:hover { opacity: .85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-success { background: var(--accent2); color: #000; }
+  .btn-danger  { background: var(--danger);  color: #fff; }
+  .btn-warn    { background: var(--warn);    color: #000; }
+  .btn-ghost   { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .canvas-wrap { position: relative; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; flex: 1; }
+  canvas { cursor: crosshair; display: block; max-width: 100%; max-height: 100%; }
+  .gate-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+  .gate-item { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; }
+  .gate-item .gate-name { font-weight: 600; font-size: 13px; }
+  .gate-item .gate-coords { font-size: 11px; color: var(--muted); }
+  .status-bar { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(15,17,23,.85); backdrop-filter: blur(4px); padding: 6px 16px; font-size: 12px; color: var(--muted); display: flex; gap: 16px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-ok   { background: #14532d; color: #4ade80; }
+  .badge-warn { background: #422006; color: var(--warn); }
+  .badge-err  { background: #450a0a; color: #f87171; }
+  .toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 18px; font-size: 13px; z-index: 999; display: none; }
+  #mode-indicator { font-weight: 700; color: var(--accent2); }
+</style>
+</head>
+<body>
+<nav>
+  <span class="logo">TrafficAgent</span>
+  <a href="/">Dashboard</a>
+  <a href="/calibrate-ui">Calibration</a>
+  <span style="color:var(--text)">Zone Editor</span>
+</nav>
+
+<div class="layout">
+  <!-- ── Left Panel ── -->
+  <div class="panel">
+
+    <div>
+      <p class="section-title">1 · Video Frame</p>
+      <label>Video file</label>
+      <select id="video-select"><option value="">Loading…</option></select>
+      <div style="margin-top:8px">
+        <label>Frame <span id="frame-num">0</span></label>
+        <input type="range" id="frame-slider" min="0" max="100" value="0" step="1">
+        <div class="btn-row" style="margin-top:6px">
+          <button class="btn-ghost" onclick="stepFrame(-30)">-30</button>
+          <button class="btn-ghost" onclick="stepFrame(-1)">-1</button>
+          <button class="btn-ghost" onclick="stepFrame(1)">+1</button>
+          <button class="btn-ghost" onclick="stepFrame(30)">+30</button>
+        </div>
+      </div>
+    </div>
+
+    <hr style="border-color:var(--border)">
+
+    <div>
+      <p class="section-title">2 · Draw Zone Polygon</p>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:8px">
+        Click on the canvas to place polygon corners.<br>
+        <b>Double-click</b> the last point to close the polygon.
+      </p>
+      <div class="btn-row">
+        <button class="btn-warn" onclick="startPolygon()">✏ Draw Polygon</button>
+        <button class="btn-ghost" onclick="clearPolygon()">Clear</button>
+      </div>
+    </div>
+
+    <hr style="border-color:var(--border)">
+
+    <div>
+      <p class="section-title">3 · Add Named Gates</p>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:8px">
+        After closing the polygon, click <b>Add Gate</b> then draw a line across an entry/exit.<br>
+        First click = start point, second click = end point.
+      </p>
+      <div class="btn-row">
+        <button class="btn-primary" onclick="startGate()" id="btn-add-gate" disabled>+ Add Gate</button>
+      </div>
+      <ul class="gate-list" id="gate-list" style="margin-top:10px"></ul>
+    </div>
+
+    <hr style="border-color:var(--border)">
+
+    <div>
+      <p class="section-title">4 · Save</p>
+      <label>Zone ID</label>
+      <input type="text" id="zone-id" placeholder="e.g. main_intersection" style="margin-bottom:10px">
+      <div class="btn-row">
+        <button class="btn-success" onclick="saveZone()">💾 Save Zone</button>
+        <button class="btn-ghost" onclick="loadExisting()">Load Existing</button>
+      </div>
+      <div id="zone-status" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+    </div>
+
+  </div>
+
+  <!-- ── Canvas Area ── -->
+  <div class="canvas-wrap" id="canvas-wrap">
+    <canvas id="canvas"></canvas>
+    <div class="status-bar">
+      <span>Mode: <span id="mode-indicator">—</span></span>
+      <span id="poly-count">Polygon: 0 pts</span>
+      <span id="gate-count-status">Gates: 0</span>
+      <span id="occupancy-status"></span>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+let bgImage = null;
+let imgW = 1, imgH = 1;
+
+let polygon = [];       // [{x,y}]
+let polygonClosed = false;
+
+let gates = [];         // [{name, p1:{x,y}, p2:{x,y}}]
+let pendingGatePt1 = null;  // first point of gate being drawn
+
+// Mode: 'polygon' | 'gate' | 'idle'
+let mode = 'idle';
+let frameDebounce = null;
+let totalFrames = 100;
+
+// Colour per gate (up to 8)
+const GATE_COLOURS = ['#f59e0b','#6c63ff','#00d4aa','#ef4444','#34d399','#fb923c','#818cf8','#f472b6'];
+
+// ─── Canvas setup ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  canvas.width  = wrap.clientWidth  - 2;
+  canvas.height = wrap.clientHeight - 34;
+  redraw();
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ─── Frame loading ────────────────────────────────────────────────────────────
+async function loadVideos() {
+  try {
+    const r = await fetch('/calibrate/videos');
+    const vids = await r.json();
+    const sel = document.getElementById('video-select');
+    sel.innerHTML = vids.map(v => `<option value="${v}">${v}</option>`).join('');
+    if (vids.length) await loadFrame();
+  } catch {}
+}
+
+async function loadFrame() {
+  const vp  = document.getElementById('video-select').value;
+  const idx = parseInt(document.getElementById('frame-slider').value);
+  document.getElementById('frame-num').textContent = idx;
+  if (!vp) return;
+  try {
+    const r = await fetch(`/calibrate/frame?video_path=${encodeURIComponent(vp)}&frame_idx=${idx}`);
+    const d = await r.json();
+    totalFrames = d.total_frames - 1;
+    document.getElementById('frame-slider').max = totalFrames;
+    imgW = d.width; imgH = d.height;
+    const img = new Image();
+    img.onload = () => { bgImage = img; redraw(); };
+    img.src = 'data:image/jpeg;base64,' + d.frame_base64;
+  } catch(e) { console.error(e); }
+}
+
+function stepFrame(delta) {
+  const s = document.getElementById('frame-slider');
+  s.value = Math.max(0, Math.min(totalFrames, parseInt(s.value) + delta));
+  loadFrame();
+}
+
+document.getElementById('frame-slider').addEventListener('input', () => {
+  clearTimeout(frameDebounce);
+  frameDebounce = setTimeout(loadFrame, 200);
+});
+document.getElementById('video-select').addEventListener('change', loadFrame);
+
+// ─── Coordinate helpers ───────────────────────────────────────────────────────
+function toPixel(cx, cy) {
+  // Canvas → video pixel
+  if (!bgImage) return {px: cx, py: cy};
+  const scale = Math.min(canvas.width / imgW, canvas.height / imgH);
+  const offX  = (canvas.width  - imgW * scale) / 2;
+  const offY  = (canvas.height - imgH * scale) / 2;
+  return {
+    px: (cx - offX) / scale,
+    py: (cy - offY) / scale
+  };
+}
+
+function toCanvas(px, py) {
+  if (!bgImage) return {cx: px, cy: py};
+  const scale = Math.min(canvas.width / imgW, canvas.height / imgH);
+  const offX  = (canvas.width  - imgW * scale) / 2;
+  const offY  = (canvas.height - imgH * scale) / 2;
+  return {cx: px * scale + offX, cy: py * scale + offY};
+}
+
+// ─── Canvas click / dblclick ──────────────────────────────────────────────────
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const {px, py} = toPixel(cx, cy);
+
+  if (mode === 'polygon' && !polygonClosed) {
+    polygon.push({x: px, y: py});
+    document.getElementById('poly-count').textContent = `Polygon: ${polygon.length} pts`;
+    redraw();
+  } else if (mode === 'gate') {
+    if (!pendingGatePt1) {
+      pendingGatePt1 = {x: px, y: py};
+    } else {
+      const name = prompt('Gate name (e.g. North, South, Entry_A):', `Gate ${gates.length + 1}`);
+      if (name) {
+        gates.push({name, p1: pendingGatePt1, p2: {x: px, y: py}});
+        renderGateList();
+        document.getElementById('gate-count-status').textContent = `Gates: ${gates.length}`;
+      }
+      pendingGatePt1 = null;
+      mode = 'idle';
+      setModeLabel('idle');
+      redraw();
+    }
+  }
+});
+
+canvas.addEventListener('dblclick', (e) => {
+  if (mode === 'polygon' && polygon.length >= 3) {
+    polygonClosed = true;
+    mode = 'idle';
+    setModeLabel('idle');
+    document.getElementById('btn-add-gate').disabled = false;
+    redraw();
+    toast('Polygon closed. Now add gates.');
+  }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!bgImage) return;
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+
+  // Draw preview line when placing a gate point
+  if (mode === 'gate' && pendingGatePt1) {
+    redraw();
+    const {cx: x1, cy: y1} = toCanvas(pendingGatePt1.x, pendingGatePt1.y);
+    ctx.save();
+    ctx.strokeStyle = '#fff';
+    ctx.setLineDash([4,4]);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(cx, cy);
+    ctx.stroke();
+    ctx.restore();
+  }
+});
+
+// ─── Mode helpers ─────────────────────────────────────────────────────────────
+function startPolygon() {
+  polygon = [];
+  polygonClosed = false;
+  mode = 'polygon';
+  document.getElementById('btn-add-gate').disabled = true;
+  setModeLabel('polygon');
+  redraw();
+}
+
+function clearPolygon() {
+  polygon = [];
+  polygonClosed = false;
+  gates = [];
+  pendingGatePt1 = null;
+  mode = 'idle';
+  setModeLabel('idle');
+  document.getElementById('btn-add-gate').disabled = true;
+  document.getElementById('gate-list').innerHTML = '';
+  document.getElementById('poly-count').textContent = 'Polygon: 0 pts';
+  document.getElementById('gate-count-status').textContent = 'Gates: 0';
+  redraw();
+}
+
+function startGate() {
+  if (!polygonClosed) return;
+  pendingGatePt1 = null;
+  mode = 'gate';
+  setModeLabel('gate');
+}
+
+function setModeLabel(m) {
+  const labels = {idle:'Idle', polygon:'Drawing polygon (dbl-click to close)', gate:'Drawing gate (2 clicks)'};
+  document.getElementById('mode-indicator').textContent = labels[m] || m;
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background image
+  if (bgImage) {
+    const scale = Math.min(canvas.width / imgW, canvas.height / imgH);
+    const offX  = (canvas.width  - imgW * scale) / 2;
+    const offY  = (canvas.height - imgH * scale) / 2;
+    ctx.drawImage(bgImage, offX, offY, imgW * scale, imgH * scale);
+  }
+
+  // Polygon fill
+  if (polygon.length >= 2) {
+    ctx.save();
+    ctx.beginPath();
+    const p0 = toCanvas(polygon[0].x, polygon[0].y);
+    ctx.moveTo(p0.cx, p0.cy);
+    for (let i = 1; i < polygon.length; i++) {
+      const p = toCanvas(polygon[i].x, polygon[i].y);
+      ctx.lineTo(p.cx, p.cy);
+    }
+    if (polygonClosed) {
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(108,99,255,0.18)';
+      ctx.fill();
+    }
+    ctx.strokeStyle = polygonClosed ? '#6c63ff' : '#a78bfa';
+    ctx.lineWidth = 2;
+    ctx.setLineDash(polygonClosed ? [] : [6,4]);
+    ctx.stroke();
+    ctx.restore();
+
+    // Vertices
+    polygon.forEach((pt, i) => {
+      const {cx, cy} = toCanvas(pt.x, pt.y);
+      ctx.save();
+      ctx.fillStyle = '#6c63ff';
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillText(i+1, cx+7, cy-7);
+      ctx.restore();
+    });
+  }
+
+  // Gates
+  gates.forEach((gate, gi) => {
+    const col = GATE_COLOURS[gi % GATE_COLOURS.length];
+    const {cx: x1, cy: y1} = toCanvas(gate.p1.x, gate.p1.y);
+    const {cx: x2, cy: y2} = toCanvas(gate.p2.x, gate.p2.y);
+    ctx.save();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+
+    // Arrow showing "enter" direction (normal = CCW of gate vector)
+    const mx = (x1+x2)/2, my = (y1+y2)/2;
+    const gvx = x2-x1, gvy = y2-y1;
+    const len = Math.sqrt(gvx*gvx+gvy*gvy) || 1;
+    const nx = -gvy/len*20, ny = gvx/len*20;
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx+nx, my+ny); ctx.stroke();
+
+    // Label
+    ctx.fillStyle = col;
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText(gate.name, mx+nx+4, my+ny-4);
+    ctx.restore();
+
+    // Endpoints
+    [[x1,y1],[x2,y2]].forEach(([cx,cy]) => {
+      ctx.save();
+      ctx.fillStyle = col; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    });
+  });
+
+  // Pending gate start point
+  if (mode === 'gate' && pendingGatePt1) {
+    const {cx, cy} = toCanvas(pendingGatePt1.x, pendingGatePt1.y);
+    ctx.save();
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ─── Gate list ────────────────────────────────────────────────────────────────
+function renderGateList() {
+  const ul = document.getElementById('gate-list');
+  ul.innerHTML = gates.map((g, i) => `
+    <li class="gate-item">
+      <div>
+        <div class="gate-name" style="color:${GATE_COLOURS[i%GATE_COLOURS.length]}">${g.name}</div>
+        <div class="gate-coords">p1=(${g.p1.x.toFixed(0)},${g.p1.y.toFixed(0)}) → p2=(${g.p2.x.toFixed(0)},${g.p2.y.toFixed(0)})</div>
+      </div>
+      <button class="btn-danger" style="padding:4px 8px;font-size:11px" onclick="removeGate(${i})">✕</button>
+    </li>`).join('');
+  redraw();
+}
+
+function removeGate(i) {
+  gates.splice(i, 1);
+  renderGateList();
+  document.getElementById('gate-count-status').textContent = `Gates: ${gates.length}`;
+}
+
+// ─── Save / Load ──────────────────────────────────────────────────────────────
+async function saveZone() {
+  const zoneId = document.getElementById('zone-id').value.trim();
+  if (!zoneId) { toast('Enter a Zone ID first.', 'warn'); return; }
+  if (polygon.length < 3 || !polygonClosed) { toast('Draw and close a polygon first.', 'warn'); return; }
+  if (gates.length < 1) { toast('Add at least one gate.', 'warn'); return; }
+
+  const body = {
+    zone_id: zoneId,
+    polygon: polygon.map(p => [p.x, p.y]),
+    gates: gates.map(g => ({name: g.name, p1: [g.p1.x, g.p1.y], p2: [g.p2.x, g.p2.y]}))
+  };
+
+  try {
+    const r = await fetch('/zone/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!r.ok) { toast(d.detail || 'Save failed.', 'err'); return; }
+    document.getElementById('zone-status').innerHTML =
+      `<span class="badge badge-ok">✓ Saved to zone_config.json</span>
+       &nbsp;${d.gate_count} gate(s)`;
+    toast('Zone saved successfully.');
+  } catch (e) { toast('Network error: ' + e, 'err'); }
+}
+
+async function loadExisting() {
+  try {
+    const r = await fetch('/zone/config');
+    if (!r.ok) { toast('No existing zone found.', 'warn'); return; }
+    const d = await r.json();
+    document.getElementById('zone-id').value = d.zone_id || '';
+    polygon = (d.polygon || []).map(p => ({x: p[0], y: p[1]}));
+    polygonClosed = polygon.length >= 3;
+    gates = (d.gates || []).map(g => ({name: g.name, p1: {x:g.p1[0],y:g.p1[1]}, p2: {x:g.p2[0],y:g.p2[1]}}));
+    renderGateList();
+    document.getElementById('poly-count').textContent = `Polygon: ${polygon.length} pts`;
+    document.getElementById('gate-count-status').textContent = `Gates: ${gates.length}`;
+    if (polygonClosed) document.getElementById('btn-add-gate').disabled = false;
+    redraw();
+    toast('Existing zone loaded.');
+  } catch(e) { toast('Failed to load: ' + e, 'err'); }
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+function toast(msg, type='ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  el.style.borderColor = type === 'warn' ? 'var(--warn)' : type === 'err' ? 'var(--danger)' : 'var(--accent2)';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.display = 'none', 3000);
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+loadVideos();
+setModeLabel('idle');
+</script>
+</body>
+</html>

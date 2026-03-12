@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrafficAgent — AI Command Center</title>
+    <meta name="description" content="Neuro-Symbolic Traffic Analytics powered by multi-hop Graph-RAG reasoning">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+    <!-- ===== Sidebar ===== -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+                        <line x1="12" y1="22" x2="12" y2="15.5"/>
+                        <polyline points="22 8.5 12 15.5 2 8.5"/>
+                    </svg>
+                </div>
+                <span class="logo-text">TrafficAgent</span>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="#" class="nav-item active" data-view="dashboard">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                <span>Dashboard</span>
+            </a>
+            <a href="#" class="nav-item" data-view="chat">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <span>Agent Chat</span>
+            </a>
+            <a href="/calibrate-ui" class="nav-item">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M8.46 8.46a5 5 0 0 0 0 7.07"/></svg>
+                <span>Calibration</span>
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="server-status" id="serverStatus">
+                <div class="status-dot offline"></div>
+                <span>Checking server...</span>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ===== Main Content ===== -->
+    <main class="main-content">
+
+        <!-- Header -->
+        <header class="top-bar">
+            <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+            </button>
+            <h1 class="page-title" id="pageTitle">Dashboard</h1>
+            <div class="top-bar-actions">
+                <div class="api-badge" id="apiBadge">
+                    <div class="api-dot"></div>
+                    <span>API</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- ===== Dashboard View ===== -->
+        <section class="view active" id="dashboardView">
+
+            <!-- Upload Card -->
+            <div class="card upload-card">
+                <div class="card-header">
+                    <h2>Upload Traffic Video</h2>
+                    <div class="chip" id="uploadStatusChip">Ready</div>
+                </div>
+                <div class="dropzone" id="dropzone">
+                    <div class="dropzone-content">
+                        <div class="dropzone-icon">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                        </div>
+                        <p class="dropzone-title">Drag & drop your video here</p>
+                        <p class="dropzone-subtitle">Supports MP4, AVI, MOV</p>
+                        <label class="browse-btn" for="fileInput">Browse Files</label>
+                        <input type="file" id="fileInput" accept=".mp4,.avi,.mov" hidden>
+                    </div>
+                    <!-- Progress overlay -->
+                    <div class="upload-progress" id="uploadProgress">
+                        <div class="progress-ring">
+                            <svg viewBox="0 0 100 100">
+                                <circle class="progress-bg" cx="50" cy="50" r="42"/>
+                                <circle class="progress-bar" cx="50" cy="50" r="42" id="progressCircle"/>
+                            </svg>
+                            <span class="progress-text" id="progressText">0%</span>
+                        </div>
+                        <p class="progress-label" id="progressLabel">Uploading...</p>
+                    </div>
+                </div>
+                <div class="upload-info" id="uploadInfo" style="display:none;">
+                    <div class="file-info">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                        <span id="fileName"></span>
+                    </div>
+                    <span class="file-size" id="fileSize"></span>
+                </div>
+            </div>
+
+            <!-- Quick Chat Card (Preview) -->
+            <div class="card chat-preview-card">
+                <div class="card-header">
+                    <h2>Quick Query</h2>
+                    <a href="#" class="card-link" id="openFullChat">Open Full Chat →</a>
+                </div>
+                <form class="quick-chat-form" id="quickChatForm">
+                    <input type="text" class="quick-input" placeholder="Ask about the traffic event..." id="quickInput" autocomplete="off">
+                    <button type="submit" class="send-btn" id="quickSendBtn">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    </button>
+                </form>
+                <div class="quick-response" id="quickResponse"></div>
+            </div>
+
+        </section>
+
+        <!-- ===== Chat View ===== -->
+        <section class="view" id="chatView">
+            <div class="chat-container">
+                <div class="chat-messages" id="chatMessages">
+                    <div class="chat-welcome">
+                        <div class="welcome-icon">
+                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+                                <line x1="12" y1="22" x2="12" y2="15.5"/>
+                                <polyline points="22 8.5 12 15.5 2 8.5"/>
+                            </svg>
+                        </div>
+                        <h2>Neuro-Symbolic Agent</h2>
+                        <p>Ask questions about traffic events. The agent uses multi-hop reasoning across vector, graph, and analytical databases.</p>
+                        <div class="example-queries">
+                            <button class="example-btn" data-query="Summarize the accident and check if Vehicle 4 was speeding.">🚗 Summarize the accident</button>
+                            <button class="example-btn" data-query="Did Vehicle 4 brake too hard?">🛑 Hard braking check</button>
+                            <button class="example-btn" data-query="Which vehicles were involved in the collision?">💥 Collision vehicles</button>
+                        </div>
+                    </div>
+                </div>
+                <form class="chat-input-bar" id="chatForm">
+                    <input type="text" class="chat-input" id="chatInput" placeholder="Ask about the traffic event..." autocomplete="off">
+                    <button type="submit" class="send-btn" id="chatSendBtn">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    </button>
+                </form>
+            </div>
+        </section>
+
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

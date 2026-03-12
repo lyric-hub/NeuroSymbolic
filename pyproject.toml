@@ -1,0 +1,33 @@
+[project]
+name = "trafficagent"
+version = "0.1.0"
+description = "Neuro-symbolic traffic analytics pipeline: dual-loop physics tracking, VLM semantic abstraction, hybrid graph/vector/time-series memory, and a local agentic reasoning layer."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boxmot>=16.0.11",
+    "duckdb>=1.4.4",
+    "fastapi>=0.135.1",
+    "kuzu>=0.11.3",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.17",
+    "langchain-ollama>=1.0.1",
+    "langgraph>=1.0.10",
+    "numpy>=2.4.3",
+    "opencv-python>=4.13.0.92",
+    "pandas>=2.3.0",
+    "pillow>=12.1.1",
+    "pydantic>=2.12.5",
+    "pymilvus[milvus-lite]>=2.6.9",
+    "python-multipart>=0.0.22",
+    "pyyaml>=6.0.3",
+    "qwen-vl-utils>=0.0.14",
+    "scipy>=1.17.1",
+    "sentence-transformers>=5.2.3",
+    "setuptools>=82.0.0",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "transformers>=5.3.0",
+    "ultralytics>=8.4.21",
+    "uvicorn>=0.41.0",
+]

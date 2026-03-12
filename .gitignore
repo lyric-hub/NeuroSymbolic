@@ -1,0 +1,57 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+.eggs/
+.Python
+
+# ─── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ─── Data — never commit raw video or DB files ────────────────────────────────
+data/raw_videos/
+data/duckdb_storage/
+data/milvus_storage/
+data/graph_storage/
+
+# ─── Calibration & zone config (machine-specific, generated locally) ──────────
+calibration.yaml
+zone_config.json
+
+# ─── Model weights ────────────────────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.plan
+*.cache
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── Secrets / keys ───────────────────────────────────────────────────────────
+secrets.yaml
+secrets.json
+
+# ─── Logs & temp ──────────────────────────────────────────────────────────────
+*.log
+*.tmp
