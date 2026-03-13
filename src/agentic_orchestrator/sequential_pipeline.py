@@ -268,5 +268,9 @@ workflow.add_edge("finalize", END)
 
 # recursion_limit caps the agent ↔ tools loop.
 # 5 tools × worst-case 5 retries = 25; 30 gives a small safety margin.
+#
+# IMPORTANT: pass the config dict at invoke time, not via .config attribute.
+# The .config attribute approach is not supported in all LangGraph versions.
+# Callers must use: agent_app.invoke(state, config=AGENT_INVOKE_CONFIG)
+AGENT_INVOKE_CONFIG: dict = {"recursion_limit": 30}
 agent_app = workflow.compile()
-agent_app.config = {"recursion_limit": 30}

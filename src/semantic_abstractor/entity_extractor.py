@@ -1,86 +1,167 @@
-import json
-from typing import List, Literal
-from pydantic import BaseModel, Field
-from langchain_core.prompts import PromptTemplate
-from langchain_community.llms import Ollama
-from langchain_core.output_parsers import JsonOutputParser
+"""
+Entity Extraction — Validation Layer
+=====================================
+Takes raw VLM JSON output and forces it into the strict Kùzu-graph-ready
+SPO schema using a local LLM (qwen2.5:72b via Ollama).
 
+This is the bridge between the neural VLM perception stage and the symbolic
+graph storage stage.  Every triple written to Kùzu passes through here.
+"""
+
+import json
+import logging
+from typing import List, Literal
+
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Entity type description — shared between schema docstring and LLM prompt.
+# ---------------------------------------------------------------------------
 _TYPE_DESCRIPTION = (
     "'Vehicle' for any motorised road user (car, truck, motorcycle, bus); "
     "'Pedestrian' for people or cyclists on foot; "
-    "'Infrastructure' for static road features (traffic_light, stop_sign, intersection, lane, road)"
+    "'Infrastructure' for static road features "
+    "(traffic_light, stop_sign, intersection, lane, road)"
 )
 
-# 1. Define the strict schema using Pydantic
+_MOTION_STATES = frozenset({"APPROACHING", "DIVERGING", "PARALLEL", "STATIONARY"})
+_PHASES = frozenset({"approach", "conflict", "resolution", "normal"})
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schema — every triple that enters the graph must match this.
+# ---------------------------------------------------------------------------
+
 class SPOTriple(BaseModel):
-    subject: str = Field(description="The acting entity, strictly using the tracked ID (e.g., 'Vehicle 4')")
+    """A single Subject-Predicate-Object interaction extracted from the scene."""
+
+    subject: str = Field(
+        description="Acting entity using its tracked ID label (e.g. 'Vehicle 4')"
+    )
     subject_type: Literal["Vehicle", "Pedestrian", "Infrastructure"] = Field(
         description=f"Entity type of the subject: {_TYPE_DESCRIPTION}"
     )
-    predicate: str = Field(description="The action or spatial relationship (e.g., 'tailgating', 'collided_with', 'turning_left')")
-    object: str = Field(description="The receiving entity or environment feature (e.g., 'Vehicle 9', 'intersection', 'pedestrian')")
+    predicate: str = Field(
+        description="Action or spatial relationship (e.g. 'tailgating', 'turning_left')"
+    )
+    object: str = Field(
+        description="Receiving entity or environment feature (e.g. 'Vehicle 9', 'intersection')"
+    )
     object_type: Literal["Vehicle", "Pedestrian", "Infrastructure"] = Field(
         description=f"Entity type of the object: {_TYPE_DESCRIPTION}"
     )
-    timestamp: float = Field(description="The exact time of the event in seconds")
+    timestamp: float = Field(
+        description="Exact time of the event in seconds"
+    )
+    motion_state: Literal["APPROACHING", "DIVERGING", "PARALLEL", "STATIONARY"] = Field(
+        default="APPROACHING",
+        description="Relative motion state between subject and object"
+    )
+    phase: Literal["approach", "conflict", "resolution", "normal"] = Field(
+        default="normal",
+        description="Interaction phase at the time of the event"
+    )
+
 
 class SceneGraphOutput(BaseModel):
-    triples: List[SPOTriple] = Field(description="A list of all interactions in the scene")
+    """Container for all SPO triples extracted from one VLM inference."""
+
+    triples: List[SPOTriple] = Field(
+        description="All subject-predicate-object interactions observed in the scene"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extractor
+# ---------------------------------------------------------------------------
 
 class EntityExtractor:
     """
-    Acts as a validation and extraction node in the Sequential Agent Pipeline.
-    Takes raw VLM text and forces it into a strict graph-ready schema.
+    Validation and extraction node in the Neuro-Symbolic pipeline.
+
+    Receives raw VLM text (JSON or free-form) and returns a list of
+    validated SPOTriple dicts ready for insertion into the Kùzu graph.
+    Uses a local LLM (ChatOllama) at temperature=0 for deterministic parsing.
+
+    Args:
+        model_name: Ollama model tag. Defaults to 'qwen2.5:72b'.
     """
-    def __init__(self, model_name: str = "qwen2.5:72b"):
-        # Initialize a fast, local LLM via Ollama for parsing
-        self.llm = Ollama(model=model_name, temperature=0.0)
-        self.parser = JsonOutputParser(pydantic_object=SceneGraphOutput)
-        
-        # Set up the prompt template that forces the JSON structure
-        self.prompt = PromptTemplate(
-            template="""
-            You are a strict data extraction parser. 
-            Extract the traffic interactions from the following Vision Language Model description.
-            Convert them into Subject-Predicate-Object triples.
-            
-            VLM Description: {vlm_text}
-            Timestamp of event: {timestamp}
-            
-            {format_instructions}
-            """,
-            input_variables=["vlm_text", "timestamp"],
-            partial_variables={"format_instructions": self.parser.get_format_instructions()},
+
+    _SYSTEM = (
+        "You are a strict data extraction parser for a traffic analysis system. "
+        "Extract ALL traffic entity interactions from the VLM description below and "
+        "convert them into Subject-Predicate-Object triples.\n\n"
+        "Rules:\n"
+        "- Use exact tracked IDs for vehicle subjects/objects (e.g. 'Vehicle 4').\n"
+        "- subject_type and object_type must be one of: Vehicle, Pedestrian, Infrastructure.\n"
+        "- motion_state must be one of: APPROACHING, DIVERGING, PARALLEL, STATIONARY.\n"
+        "- phase must be one of: approach, conflict, resolution, normal.\n"
+        "- If a field is uncertain, use the stated default.\n\n"
+        "{format_instructions}"
+    )
+
+    def __init__(self, model_name: str = "qwen2.5:72b") -> None:
+        self._llm = ChatOllama(model=model_name, temperature=0.0)
+        self._parser = JsonOutputParser(pydantic_object=SceneGraphOutput)
+        self._system_text = self._SYSTEM.format(
+            format_instructions=self._parser.get_format_instructions()
         )
-        
-        # Create the LangChain processing chain
-        self.chain = self.prompt | self.llm | self.parser
 
     def extract_triples(self, raw_vlm_text: str, current_time: float) -> List[dict]:
         """
-        Executes the extraction and returns guaranteed, validated dictionaries 
-        ready for the Kùzu/Neo4j Graph Database.
+        Parse raw VLM output into validated SPO dicts for Kùzu insertion.
+
+        Args:
+            raw_vlm_text: JSON string or free-text from vlm_inference.py.
+            current_time:  Video timestamp in seconds (used only for logging).
+
+        Returns:
+            List of validated triple dicts (may be empty on parse failure).
         """
         try:
-            print(f"Extracting structured entities for timestamp {current_time}...")
-            # Run the extraction chain
-            result = self.chain.invoke({
-                "vlm_text": raw_vlm_text,
-                "timestamp": current_time
-            })
-            
-            # Return the validated list of triples
-            return result.get("triples", [])
-            
-        except Exception as e:
-            print(f"Failed to parse entities: {e}")
-            # Fallback to prevent pipeline crash
+            log.debug("Extracting entities at t=%.2fs", current_time)
+            messages = [
+                SystemMessage(content=self._system_text),
+                HumanMessage(
+                    content=(
+                        f"VLM Description: {raw_vlm_text}\n"
+                        f"Timestamp of event: {current_time}"
+                    )
+                ),
+            ]
+            result = self._parser.parse(
+                self._llm.invoke(messages).content
+            )
+            triples = result.get("triples", [])
+            log.debug("Extracted %d triples at t=%.2fs", len(triples), current_time)
+            return triples
+
+        except Exception:
+            log.exception(
+                "Entity extraction failed at t=%.2fs — returning empty list",
+                current_time,
+            )
             return []
 
-# Example Usage:
+
+# ---------------------------------------------------------------------------
+# Quick smoke-test (run with: python -m src.semantic_abstractor.entity_extractor)
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     extractor = EntityExtractor()
-    mock_vlm_output = "I see Vehicle 4 following very closely behind Vehicle 9 in the heavy rain."
-    
-    structured_data = extractor.extract_triples(mock_vlm_output, current_time=12.5)
-    print(json.dumps(structured_data, indent=2))
+    mock_vlm = json.dumps([{
+        "subject": "Vehicle 4",
+        "predicate": "tailgating",
+        "object": "Vehicle 9",
+        "motion_state": "APPROACHING",
+        "phase": "conflict",
+        "timestamp": 12.5,
+    }])
+    structured = extractor.extract_triples(mock_vlm, current_time=12.5)
+    print(json.dumps(structured, indent=2))

@@ -27,5 +27,9 @@ fastapi
 uvicorn
 setuptools
 
+# Development / testing
+pytest
+pytest-asyncio
+
 
 ollama

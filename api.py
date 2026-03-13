@@ -15,7 +15,7 @@ from typing import List
 
 # Import your existing pipeline and agent
 from main import process_video
-from src.agentic_orchestrator.sequential_pipeline import agent_app
+from src.agentic_orchestrator.sequential_pipeline import agent_app, AGENT_INVOKE_CONFIG
 from src.physics_engine.calibration_router import router as calibration_router
 from src.physics_engine.zone_router import router as zone_router
 from src.symbolic_engine.alert_engine import TrafficAlert
@@ -183,7 +183,8 @@ async def chat_with_agent(request: ChatRequest):
             detail="Video is still being processed. Wait for the job to finish before querying.",
         )
 
-    print(f"Received query: {request.query}")
+    import logging as _log
+    _log.getLogger(__name__).info("Chat query: %s", request.query)
 
     try:
         # agent_app.invoke() is synchronous (runs Ollama LLM calls).
@@ -191,7 +192,9 @@ async def chat_with_agent(request: ChatRequest):
         # freezes every other request.  asyncio.to_thread() moves it to a
         # thread-pool worker, keeping the event loop free.
         initial_state = {"query": request.query}
-        final_state = await asyncio.to_thread(agent_app.invoke, initial_state)
+        final_state = await asyncio.to_thread(
+            agent_app.invoke, initial_state, AGENT_INVOKE_CONFIG
+        )
 
         summary = final_state.get("final_summary", "No summary generated.")
         return ChatResponse(query=request.query, summary=summary)

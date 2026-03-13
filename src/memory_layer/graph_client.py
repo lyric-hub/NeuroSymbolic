@@ -56,11 +56,29 @@ class GraphClient:
                     FROM Infrastructure TO Infrastructure,
                     predicate STRING,
                     timestamp DOUBLE,
-                    trajectory_time_window STRING
+                    trajectory_time_window STRING,
+                    motion_state STRING,
+                    phase STRING
                 )
             """)
         except RuntimeError:
-            pass  # Already exists
+            pass  # Already exists — attempt column migration for older DBs
+            self._migrate_interacts_with()
+
+    def _migrate_interacts_with(self) -> None:
+        """
+        Adds motion_state and phase columns to an existing INTERACTS_WITH table
+        (created before these fields were introduced).  Safe to call repeatedly —
+        errors from already-present columns are silently ignored.
+        """
+        for col, default in (("motion_state", "APPROACHING"), ("phase", "normal")):
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE INTERACTS_WITH ADD {col} STRING DEFAULT '{default}'"
+                )
+                log.info("Migrated INTERACTS_WITH: added column '%s'", col)
+            except Exception:
+                pass  # Column already present in this DB version
 
         # PRECEDES: temporal continuity edge on the same vehicle node.
         # Self-edge (Vehicle → Vehicle with the same name) linking consecutive
@@ -125,22 +143,57 @@ class GraphClient:
             self._upsert_entity(subject_name, subject_type)
             self._upsert_entity(object_name, object_type)
 
-            # 2. Create the directed interaction edge with physics pointers.
+            # 2. Create the directed interaction edge with physics + semantic pointers.
             # Node labels come from the validated frozenset, not from user input.
+            motion_state = str(triple.get("motion_state", "APPROACHING")).upper()
+            phase = str(triple.get("phase", "normal")).lower()
+
             edge_query = f"""
-                MATCH (s:{subject_type} {{name: $subject}}), (o:{object_type} {{name: $object}})
-                CREATE (s)-[:INTERACTS_WITH {{predicate: $pred, timestamp: $ts, trajectory_time_window: $window}}]->(o)
+                MATCH (s:{subject_type} {{name: $subject}}),
+                      (o:{object_type} {{name: $object}})
+                CREATE (s)-[:INTERACTS_WITH {{
+                    predicate:               $pred,
+                    timestamp:               $ts,
+                    trajectory_time_window:  $window,
+                    motion_state:            $motion_state,
+                    phase:                   $phase
+                }}]->(o)
             """
-            self.conn.execute(
-                edge_query,
-                parameters={
-                    "subject": subject_name,
-                    "object": object_name,
-                    "pred": predicate_desc,
-                    "ts": timestamp,
-                    "window": time_window
-                }
-            )
+            try:
+                self.conn.execute(
+                    edge_query,
+                    parameters={
+                        "subject":       subject_name,
+                        "object":        object_name,
+                        "pred":          predicate_desc,
+                        "ts":            timestamp,
+                        "window":        time_window,
+                        "motion_state":  motion_state,
+                        "phase":         phase,
+                    },
+                )
+            except Exception:
+                # Fallback for older databases without motion_state/phase columns.
+                fallback = f"""
+                    MATCH (s:{subject_type} {{name: $subject}}),
+                          (o:{object_type} {{name: $object}})
+                    CREATE (s)-[:INTERACTS_WITH {{
+                        predicate:              $pred,
+                        timestamp:              $ts,
+                        trajectory_time_window: $window
+                    }}]->(o)
+                """
+                self.conn.execute(
+                    fallback,
+                    parameters={
+                        "subject": subject_name,
+                        "object":  object_name,
+                        "pred":    predicate_desc,
+                        "ts":      timestamp,
+                        "window":  time_window,
+                    },
+                )
+                log.debug("Inserted edge without motion_state/phase (old schema)")
 
     def insert_temporal_edges(
         self,
