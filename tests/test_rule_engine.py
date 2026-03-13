@@ -93,7 +93,7 @@ class TestSpeedingRule:
         violations = _evaluate(df)
         speeding = [v for v in violations if v.rule_id == "SPEEDING"]
         assert speeding, "Expected SPEEDING violation"
-        assert "peak_speed_ms" in speeding[0].evidence
+        assert "max_speed_ms" in speeding[0].evidence
 
     def test_speeding_severity_is_violation(self):
         df = make_trajectory_df(speed_ms=20.0)

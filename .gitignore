@@ -26,7 +26,7 @@ data/graph_storage/
 data/ullooor/
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
-calibration.yaml
+# calibration.yaml
 zone_config.json
 
 # ─── Model weights ────────────────────────────────────────────────────────────

@@ -62,8 +62,20 @@ class GraphClient:
                 )
             """)
         except RuntimeError:
-            pass  # Already exists — attempt column migration for older DBs
-            self._migrate_interacts_with()
+            self._migrate_interacts_with()  # Already exists — migrate older schema
+
+        try:
+            self.conn.execute("""
+                CREATE REL TABLE PRECEDES (
+                    FROM Vehicle TO Vehicle,
+                    FROM Pedestrian TO Pedestrian,
+                    from_window    STRING,
+                    to_window      STRING,
+                    gap_seconds    DOUBLE
+                )
+            """)
+        except RuntimeError:
+            pass  # Already exists
 
     def _migrate_interacts_with(self) -> None:
         """

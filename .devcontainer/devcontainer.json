@@ -32,5 +32,5 @@
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "remoteUser": "root",
-  "postCreateCommand": "apt-get update && apt-get install -y tmux nvtop  zstd git curl libmediainfo0v5 libgl1 libglib2.0-0 2>&1 | tail -3 && git config --global --add safe.directory /workspace && git config --global user.name 'lyric-hub' && git config --global user.email 'csaju53@gmail.com' && pip install --upgrade pip && pip install -r requirements.txt"
+  "postCreateCommand": "apt-get update && apt-get install -y tmux nvtop  zstd git curl libmediainfo0v5 libgl1 libglib2.0-0 2>&1 | tail -3 && git config --global --add safe.directory /workspace && git config --global user.name 'lyric-hub' && git config --global user.email 'csaju53@gmail.com' && pip install --upgrade pip && pip install -r requirements.txt  && curl -fsSL https://ollama.com/install.sh | sh"
 }

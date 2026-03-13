@@ -14,7 +14,7 @@
 
         .calib-layout {
             display: grid;
-            grid-template-columns: 1fr 360px;
+            grid-template-columns: 1fr 380px;
             gap: 20px;
             padding: 24px;
             max-width: 1600px;
@@ -111,6 +111,36 @@
             margin-bottom: 14px;
         }
 
+        /* ── Method tabs ── */
+        .method-tabs {
+            display: flex;
+            gap: 0;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            margin-bottom: 0;
+        }
+        .method-tab {
+            flex: 1;
+            padding: 8px 12px;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background var(--transition-fast), color var(--transition-fast);
+            border-right: 1px solid var(--border-subtle);
+        }
+        .method-tab:last-child { border-right: none; }
+        .method-tab:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
+        .method-tab.active {
+            background: rgba(0,200,255,0.12);
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .method-tab .tab-icon { margin-right: 5px; font-size: 0.9em; }
+
         /* ── Video selector ── */
         select {
             width: 100%;
@@ -126,6 +156,81 @@
             transition: border-color var(--transition-fast);
         }
         select:focus { border-color: var(--accent); }
+
+        /* ── KML import panel ── */
+        .kml-drop-zone {
+            border: 2px dashed var(--border-subtle);
+            border-radius: var(--radius-sm);
+            padding: 16px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color var(--transition-fast), background var(--transition-fast);
+            font-size: 0.82rem;
+            color: var(--text-muted);
+        }
+        .kml-drop-zone:hover,
+        .kml-drop-zone.drag-over {
+            border-color: var(--accent);
+            background: rgba(0,200,255,0.05);
+            color: var(--text-primary);
+        }
+        .kml-drop-zone input[type=file] { display: none; }
+
+        .kml-placemark-list {
+            margin-top: 12px;
+            max-height: 160px;
+            overflow-y: auto;
+            font-size: 0.78rem;
+        }
+        .kml-placemark-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 6px;
+            border-radius: 4px;
+            border-bottom: 1px solid var(--border-subtle);
+            gap: 8px;
+        }
+        .kml-placemark-item:last-child { border-bottom: none; }
+        .kml-pm-assigned { opacity: 0.4; }
+        .kml-pm-name {
+            font-weight: 500;
+            color: var(--text-primary);
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .kml-pm-coords {
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            white-space: nowrap;
+        }
+        .kml-pm-badge {
+            font-size: 0.7rem;
+            padding: 1px 6px;
+            border-radius: 10px;
+            background: rgba(0,200,255,0.15);
+            color: var(--accent);
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .kml-pm-badge.used {
+            background: rgba(0,230,138,0.12);
+            color: var(--success);
+        }
+
+        .ge-origin-info {
+            margin-top: 10px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            padding: 6px 8px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 4px;
+            border: 1px solid var(--border-subtle);
+        }
 
         /* ── Points table ── */
         .points-table {
@@ -161,7 +266,7 @@
         }
 
         .world-input {
-            width: 64px;
+            width: 72px;
             background: var(--bg-input);
             border: 1px solid var(--border-subtle);
             border-radius: 4px;
@@ -174,6 +279,7 @@
             transition: border-color var(--transition-fast);
         }
         .world-input:focus { border-color: var(--accent); }
+        .world-input.latlng { width: 88px; }
 
         .delete-btn {
             background: none;
@@ -326,6 +432,28 @@
             color: var(--text-muted);
             line-height: 1.5;
         }
+
+        .ge-steps {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            line-height: 1.7;
+            padding-left: 0;
+            list-style: none;
+        }
+        .ge-steps li { display: flex; gap: 8px; }
+        .ge-steps .step-num {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px; height: 18px;
+            border-radius: 50%;
+            background: rgba(0,200,255,0.15);
+            color: var(--accent);
+            font-size: 0.7rem;
+            font-weight: 700;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
     </style>
 </head>
 <body>
@@ -357,12 +485,20 @@
             <span class="frame-counter" id="frameCounter">— / —</span>
         </div>
 
-        <p class="hint">
+        <!-- Hint — swaps based on active method -->
+        <p class="hint" id="hintDirect">
             Click on the frame to place a point. Enter the corresponding real-world
             ground coordinates (in metres) in the table on the right.
             You need at least <strong>4 non-collinear</strong> points for a valid calibration.
-            After computing, reprojected points are shown in red on the frame.
         </p>
+        <div id="hintGE" style="display:none;">
+            <ul class="ge-steps">
+                <li><span class="step-num">1</span><span>In Google Earth Pro, mark your reference points with placemarks (Add → Placemark) or copy coordinates from the "What's here?" tooltip.</span></li>
+                <li><span class="step-num">2</span><span>Export placemarks: <em>File → Save → Save Place As… → KML</em>. Then import the KML below — or type lat/lon manually.</span></li>
+                <li><span class="step-num">3</span><span>Click the same landmarks in the video frame. Lat/lon from imported placemarks is auto-assigned in order.</span></li>
+                <li><span class="step-num">4</span><span>Click <strong>Compute &amp; Save</strong>. Coordinates are auto-converted to metres before computing.</span></li>
+            </ul>
+        </div>
     </div>
 
     <!-- ═══════════════════════════════
@@ -382,6 +518,19 @@
             <div id="statusDetail" style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;"></div>
         </div>
 
+        <!-- Method selector -->
+        <div class="panel-card">
+            <h3>Calibration Method</h3>
+            <div class="method-tabs">
+                <button class="method-tab active" data-mode="direct">
+                    <span class="tab-icon">📐</span>Direct (metres)
+                </button>
+                <button class="method-tab" data-mode="gearth">
+                    <span class="tab-icon">🌍</span>Google Earth Pro
+                </button>
+            </div>
+        </div>
+
         <!-- Video selector -->
         <div class="panel-card">
             <h3>Video Source</h3>
@@ -390,16 +539,29 @@
             </select>
         </div>
 
+        <!-- KML import (Google Earth mode only) -->
+        <div class="panel-card" id="kmlCard" style="display:none;">
+            <h3>KML Import <span style="font-size:0.7rem; color:var(--text-muted); font-weight:400; text-transform:none;">(optional)</span></h3>
+            <div class="kml-drop-zone" id="kmlDropZone" title="Click or drag a KML file here">
+                <input type="file" id="kmlFileInput" accept=".kml">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom:6px; opacity:0.5;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <div>Drop KML file here or <strong>click to browse</strong></div>
+                <div style="margin-top:4px; font-size:0.72rem;">Exported from Google Earth Pro · File → Save Place As → KML</div>
+            </div>
+            <div class="kml-placemark-list" id="kmlPlacemarkList" style="display:none;"></div>
+            <div class="ge-origin-info" id="geOriginInfo" style="display:none;"></div>
+        </div>
+
         <!-- Points table -->
         <div class="panel-card" style="flex:1;">
             <h3>Calibration Points <span id="pointCount" style="color:var(--accent);">(0)</span></h3>
             <table class="points-table">
-                <thead>
+                <thead id="tableHead">
                     <tr>
                         <th>#</th>
                         <th>Pixel (x, y)</th>
-                        <th>World X (m)</th>
-                        <th>World Y (m)</th>
+                        <th id="col3Head">World X (m)</th>
+                        <th id="col4Head">World Y (m)</th>
                         <th></th>
                     </tr>
                 </thead>
@@ -441,14 +603,16 @@
 // State
 // ═══════════════════════════════════════════════════════════
 const state = {
-    videoFile: null,
-    totalFrames: 0,
-    frameIdx: 0,
-    imageW: 0,
-    imageH: 0,
-    points: [],          // [{pixelX, pixelY, worldX, worldY}]
-    projectedPts: [],    // [{projectedX, projectedY}] from last compute
+    videoFile:    null,
+    totalFrames:  0,
+    frameIdx:     0,
+    imageW:       0,
+    imageH:       0,
+    mode:         "direct",     // "direct" | "gearth"
+    points:       [],           // [{pixelX, pixelY, worldX, worldY, lat, lon}]
+    projectedPts: [],
     scrubTimeout: null,
+    kmlQueue:     [],           // [{name, lat, lon}] — unassigned KML placemarks
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -472,9 +636,18 @@ const statusText    = document.getElementById("statusText");
 const statusDetail  = document.getElementById("statusDetail");
 const prevBtn       = document.getElementById("prevBtn");
 const nextBtn       = document.getElementById("nextBtn");
+const kmlCard       = document.getElementById("kmlCard");
+const kmlDropZone   = document.getElementById("kmlDropZone");
+const kmlFileInput  = document.getElementById("kmlFileInput");
+const kmlList       = document.getElementById("kmlPlacemarkList");
+const geOriginInfo  = document.getElementById("geOriginInfo");
+const col3Head      = document.getElementById("col3Head");
+const col4Head      = document.getElementById("col4Head");
+const hintDirect    = document.getElementById("hintDirect");
+const hintGE        = document.getElementById("hintGE");
 
 // ═══════════════════════════════════════════════════════════
-// Toast helper
+// Toast
 // ═══════════════════════════════════════════════════════════
 function toast(msg, type = "info") {
     const el = document.getElementById("toast");
@@ -485,7 +658,7 @@ function toast(msg, type = "info") {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Init: load video list + calibration status
+// Init
 // ═══════════════════════════════════════════════════════════
 async function init() {
     await Promise.all([loadVideos(), loadStatus()]);
@@ -514,6 +687,130 @@ async function loadStatus() {
         statusText.textContent = "Not calibrated";
         statusDetail.textContent = "";
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Method tab switching
+// ═══════════════════════════════════════════════════════════
+document.querySelectorAll(".method-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+        document.querySelectorAll(".method-tab").forEach(t => t.classList.remove("active"));
+        tab.classList.add("active");
+        state.mode = tab.dataset.mode;
+        applyMode();
+    });
+});
+
+function applyMode() {
+    const isGE = state.mode === "gearth";
+
+    // Toggle KML card visibility
+    kmlCard.style.display  = isGE ? "block" : "none";
+
+    // Toggle hints
+    hintDirect.style.display = isGE ? "none"  : "block";
+    hintGE.style.display     = isGE ? "block" : "none";
+
+    // Update table header
+    col3Head.textContent = isGE ? "Latitude"  : "World X (m)";
+    col4Head.textContent = isGE ? "Longitude" : "World Y (m)";
+
+    // Re-render table for new column types
+    renderTable();
+    redraw();
+}
+
+// ═══════════════════════════════════════════════════════════
+// KML Parsing (Google Earth Pro export)
+// ═══════════════════════════════════════════════════════════
+function parseKML(text) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, "text/xml");
+    const placemarks = Array.from(doc.querySelectorAll("Placemark"));
+    const results = [];
+    placemarks.forEach(pm => {
+        const name  = pm.querySelector("name")?.textContent?.trim() || "Point";
+        const coordEl = pm.querySelector("Point coordinates");
+        if (!coordEl) return;
+        const raw = coordEl.textContent.trim();
+        // KML format: longitude,latitude[,altitude]
+        const parts = raw.split(",").map(s => parseFloat(s.trim()));
+        if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            results.push({ name, lon: parts[0], lat: parts[1] });
+        }
+    });
+    return results;
+}
+
+function handleKMLFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const placemarks = parseKML(e.target.result);
+        if (!placemarks.length) {
+            toast("No point placemarks found in KML.", "error");
+            return;
+        }
+        state.kmlQueue = placemarks.map(p => ({ ...p, assigned: false }));
+        renderKMLList();
+        toast(`Loaded ${placemarks.length} placemarks from KML.`, "success");
+    };
+    reader.readAsText(file);
+}
+
+function renderKMLList() {
+    const all = state.kmlQueue;
+    if (!all.length) { kmlList.style.display = "none"; return; }
+    kmlList.style.display = "block";
+    kmlList.innerHTML = all.map((pm, i) => `
+        <div class="kml-placemark-item ${pm.assigned ? "kml-pm-assigned" : ""}">
+            <span class="kml-pm-badge ${pm.assigned ? "used" : ""}">
+                ${pm.assigned ? "✓ " + pm.assignedTo : "→ pt " + (i + 1)}
+            </span>
+            <span class="kml-pm-name" title="${pm.name}">${pm.name}</span>
+            <span class="kml-pm-coords">${pm.lat.toFixed(6)}°, ${pm.lon.toFixed(6)}°</span>
+        </div>
+    `).join("");
+}
+
+// Drop zone events
+kmlDropZone.addEventListener("click",    () => kmlFileInput.click());
+kmlFileInput.addEventListener("change",  () => handleKMLFile(kmlFileInput.files[0]));
+kmlDropZone.addEventListener("dragover", (e) => { e.preventDefault(); kmlDropZone.classList.add("drag-over"); });
+kmlDropZone.addEventListener("dragleave",     ()  => kmlDropZone.classList.remove("drag-over"));
+kmlDropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    kmlDropZone.classList.remove("drag-over");
+    handleKMLFile(e.dataTransfer.files[0]);
+});
+
+// ═══════════════════════════════════════════════════════════
+// Lat/Lon → Local metres (equirectangular, accurate < 1 km)
+// ═══════════════════════════════════════════════════════════
+function latlngToMetres(lat, lon, originLat, originLon) {
+    const R   = 6371000;                   // Earth radius in metres
+    const lat1 = originLat * Math.PI / 180;
+    const x   = (lon - originLon) * (Math.PI / 180) * R * Math.cos(lat1);
+    const y   = (lat - originLat) * (Math.PI / 180) * R;
+    return { x, y };
+}
+
+function computeOrigin(points) {
+    // Use centroid of all lat/lon as origin to minimise coordinate magnitudes
+    const n   = points.length;
+    const lat = points.reduce((s, p) => s + p.lat, 0) / n;
+    const lon = points.reduce((s, p) => s + p.lon, 0) / n;
+    return { lat, lon };
+}
+
+function updateOriginInfo(points) {
+    const valid = points.filter(p => p.lat !== "" && p.lon !== "");
+    if (!valid.length) { geOriginInfo.style.display = "none"; return; }
+    const origin = computeOrigin(valid);
+    geOriginInfo.style.display = "block";
+    geOriginInfo.textContent =
+        `Origin (centroid): ${origin.lat.toFixed(6)}° N, ${origin.lon.toFixed(6)}° E  ·  ` +
+        `${valid.length} of ${points.length} pts have coordinates`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -555,10 +852,13 @@ function redraw(img) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(image, 0, 0);
 
-    // Draw placed points
     state.points.forEach((pt, i) => {
-        // Crosshair
-        ctx.strokeStyle = "#00c8ff";
+        const hasCoords = state.mode === "direct"
+            ? (pt.worldX !== "" && pt.worldY !== "")
+            : (pt.lat !== "" && pt.lon !== "");
+        const color = hasCoords ? "#00e68a" : "#00c8ff";
+
+        ctx.strokeStyle = color;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(pt.pixelX - 10, pt.pixelY);
@@ -567,29 +867,14 @@ function redraw(img) {
         ctx.lineTo(pt.pixelX, pt.pixelY + 10);
         ctx.stroke();
 
-        // Circle
-        ctx.strokeStyle = "#00c8ff";
+        ctx.strokeStyle = color;
         ctx.beginPath();
         ctx.arc(pt.pixelX, pt.pixelY, 6, 0, 2 * Math.PI);
         ctx.stroke();
 
-        // Label
-        ctx.fillStyle = "#00c8ff";
+        ctx.fillStyle = color;
         ctx.font = "bold 13px 'JetBrains Mono', monospace";
         ctx.fillText(i + 1, pt.pixelX + 9, pt.pixelY - 6);
-    });
-
-    // Draw reprojected points (from last compute)
-    state.projectedPts.forEach((pt, i) => {
-        ctx.strokeStyle = "#ff5c6c";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.arc(pt.projectedX, pt.projectedY, 5, 0, 2 * Math.PI);
-        ctx.stroke();
-
-        ctx.fillStyle = "#ff5c6c";
-        ctx.font = "11px 'JetBrains Mono', monospace";
-        ctx.fillText(`R${i + 1}`, pt.projectedX + 7, pt.projectedY + 4);
     });
 }
 
@@ -603,8 +888,22 @@ canvas.addEventListener("click", (e) => {
     const px = (e.clientX - rect.left)  * scaleX;
     const py = (e.clientY - rect.top)   * scaleY;
 
-    state.points.push({ pixelX: px, pixelY: py, worldX: "", worldY: "" });
-    state.projectedPts = [];   // clear stale reprojections
+    const newPt = { pixelX: px, pixelY: py, worldX: "", worldY: "", lat: "", lon: "" };
+
+    // In GE mode: auto-assign next unassigned KML placemark
+    if (state.mode === "gearth") {
+        const nextKML = state.kmlQueue.find(p => !p.assigned);
+        if (nextKML) {
+            newPt.lat = nextKML.lat;
+            newPt.lon = nextKML.lon;
+            nextKML.assigned  = true;
+            nextKML.assignedTo = state.points.length + 1;
+            renderKMLList();
+        }
+    }
+
+    state.points.push(newPt);
+    state.projectedPts = [];
     renderTable();
     redraw();
 });
@@ -616,44 +915,76 @@ function renderTable() {
     pointCount.textContent = `(${state.points.length})`;
     computeBtn.disabled = state.points.length < 4;
 
+    if (state.mode === "gearth") updateOriginInfo(state.points);
+
     if (state.points.length === 0) {
         pointsBody.innerHTML = `<tr><td colspan="5" class="no-points">No points placed yet.</td></tr>`;
         return;
     }
 
-    pointsBody.innerHTML = state.points.map((pt, i) => `
-        <tr>
-            <td class="point-idx">${i + 1}</td>
-            <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
-            <td>
-                <input class="world-input" type="number" step="0.1"
-                    value="${pt.worldX}" placeholder="0.0"
-                    data-idx="${i}" data-axis="worldX">
-            </td>
-            <td>
-                <input class="world-input" type="number" step="0.1"
-                    value="${pt.worldY}" placeholder="0.0"
-                    data-idx="${i}" data-axis="worldY">
-            </td>
-            <td>
-                <button class="delete-btn" data-idx="${i}" title="Remove point">✕</button>
-            </td>
-        </tr>
-    `).join("");
+    if (state.mode === "direct") {
+        pointsBody.innerHTML = state.points.map((pt, i) => `
+            <tr>
+                <td class="point-idx">${i + 1}</td>
+                <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
+                <td>
+                    <input class="world-input" type="number" step="0.1"
+                        value="${pt.worldX}" placeholder="0.0"
+                        data-idx="${i}" data-axis="worldX">
+                </td>
+                <td>
+                    <input class="world-input" type="number" step="0.1"
+                        value="${pt.worldY}" placeholder="0.0"
+                        data-idx="${i}" data-axis="worldY">
+                </td>
+                <td><button class="delete-btn" data-idx="${i}" title="Remove">✕</button></td>
+            </tr>
+        `).join("");
+    } else {
+        pointsBody.innerHTML = state.points.map((pt, i) => `
+            <tr>
+                <td class="point-idx">${i + 1}</td>
+                <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
+                <td>
+                    <input class="world-input latlng" type="number" step="0.000001"
+                        value="${pt.lat}" placeholder="lat"
+                        data-idx="${i}" data-axis="lat">
+                </td>
+                <td>
+                    <input class="world-input latlng" type="number" step="0.000001"
+                        value="${pt.lon}" placeholder="lon"
+                        data-idx="${i}" data-axis="lon">
+                </td>
+                <td><button class="delete-btn" data-idx="${i}" title="Remove">✕</button></td>
+            </tr>
+        `).join("");
+    }
 
-    // World coord inputs
+    // Bind input changes
     pointsBody.querySelectorAll(".world-input").forEach(input => {
         input.addEventListener("change", (e) => {
             const idx  = parseInt(e.target.dataset.idx);
             const axis = e.target.dataset.axis;
             state.points[idx][axis] = parseFloat(e.target.value) || 0;
+            if (state.mode === "gearth") updateOriginInfo(state.points);
+            redraw();
         });
     });
 
-    // Delete buttons
+    // Bind delete
     pointsBody.querySelectorAll(".delete-btn").forEach(btn => {
         btn.addEventListener("click", (e) => {
             const idx = parseInt(e.target.dataset.idx);
+            // Un-assign KML placemark if there was one
+            if (state.mode === "gearth") {
+                const pt = state.points[idx];
+                if (pt.lat !== "" && pt.lon !== "") {
+                    const match = state.kmlQueue.find(
+                        p => p.assigned && Math.abs(p.lat - pt.lat) < 1e-9 && Math.abs(p.lon - pt.lon) < 1e-9
+                    );
+                    if (match) { match.assigned = false; match.assignedTo = undefined; renderKMLList(); }
+                }
+            }
             state.points.splice(idx, 1);
             state.projectedPts = [];
             renderTable();
@@ -666,20 +997,35 @@ function renderTable() {
 // Compute
 // ═══════════════════════════════════════════════════════════
 computeBtn.addEventListener("click", async () => {
-    // Validate all world coords are filled
-    const missing = state.points.some(p => p.worldX === "" || p.worldY === "");
-    if (missing) { toast("Please fill in all real-world coordinates.", "error"); return; }
+    let pointPairs;
+
+    if (state.mode === "direct") {
+        const missing = state.points.some(p => p.worldX === "" || p.worldY === "");
+        if (missing) { toast("Please fill in all real-world coordinates.", "error"); return; }
+
+        pointPairs = state.points.map(p => ({
+            pixel_x: p.pixelX, pixel_y: p.pixelY,
+            world_x: p.worldX, world_y: p.worldY,
+        }));
+    } else {
+        // Google Earth mode — convert lat/lon → metres
+        const missingLatLon = state.points.some(p => p.lat === "" || p.lon === "");
+        if (missingLatLon) { toast("Please fill in all lat/lon coordinates.", "error"); return; }
+
+        const origin = computeOrigin(state.points);
+        pointPairs = state.points.map(p => {
+            const { x, y } = latlngToMetres(p.lat, p.lon, origin.lat, origin.lon);
+            return { pixel_x: p.pixelX, pixel_y: p.pixelY, world_x: x, world_y: y };
+        });
+    }
 
     computeBtn.disabled = true;
     computeBtn.textContent = "Computing...";
 
     const payload = {
-        video_path: state.videoFile,
-        frame_idx:  state.frameIdx,
-        point_pairs: state.points.map(p => ({
-            pixel_x: p.pixelX, pixel_y: p.pixelY,
-            world_x: p.worldX, world_y: p.worldY,
-        })),
+        video_path:  state.videoFile,
+        frame_idx:   state.frameIdx,
+        point_pairs: pointPairs,
     };
 
     try {
@@ -691,7 +1037,6 @@ computeBtn.addEventListener("click", async () => {
         const data = await res.json();
         if (!res.ok) { toast(data.detail || "Compute failed.", "error"); return; }
 
-        // Show results panel
         resultsCard.style.display = "block";
         const rmse = data.rmse;
         rmseValue.textContent = rmse.toFixed(4);
@@ -708,13 +1053,10 @@ computeBtn.addEventListener("click", async () => {
             </tr>
         `).join("");
 
-        // Store projected points for canvas overlay
-        // Note: projected coords are in world space (metres), not pixel space.
-        // We do NOT draw them on the canvas since they're in a different coordinate system.
-        // Instead we just show the numeric errors in the table.
         state.projectedPts = [];
 
-        toast(`Saved! RMSE = ${rmse.toFixed(4)} m`, "success");
+        const modeLabel = state.mode === "gearth" ? " (Google Earth)" : "";
+        toast(`Saved! RMSE = ${rmse.toFixed(4)} m${modeLabel}`, "success");
         await loadStatus();
 
     } catch (err) {
@@ -774,7 +1116,10 @@ nextBtn.addEventListener("click", () => {
 clearBtn.addEventListener("click", () => {
     state.points = [];
     state.projectedPts = [];
+    state.kmlQueue.forEach(p => { p.assigned = false; p.assignedTo = undefined; });
+    renderKMLList();
     resultsCard.style.display = "none";
+    if (state.mode === "gearth") geOriginInfo.style.display = "none";
     renderTable();
     redraw();
 });

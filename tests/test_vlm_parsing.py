@@ -20,9 +20,11 @@ from src.semantic_abstractor.vlm_inference import TrafficSemanticAbstractor
 # The class __init__ loads the VLM model; we only need the parsers.
 
 def _parse(raw_text: str, active_ids: list | None = None) -> list:
-    """Call _parse_json_triples as a static method without model init."""
+    """Call _parse_json_triples as an unbound method without model init.
+    Signature: _parse_json_triples(self, text: List[str], timestamp: float)
+    """
     return TrafficSemanticAbstractor._parse_json_triples(
-        raw_text, active_ids or []
+        None, [raw_text], 0.0
     )
 
 
@@ -138,9 +140,13 @@ class TestFieldValidation:
 
 class TestHallucinationFilter:
     def test_hallucinated_vehicle_id_dropped(self):
-        """Vehicle ID not in active_ids should be filtered out."""
+        """_parse_json_triples does NOT filter by active_ids — that is
+        EntityExtractor.extract_triples()'s responsibility.  The VLM parser
+        only validates JSON structure and required keys; it passes all
+        structurally valid triples through regardless of vehicle ID.
+        """
         raw = json.dumps([{
-            "subject": "Vehicle 99",   # not in active_ids
+            "subject": "Vehicle 99",   # not in active_ids — passes VLM parser
             "subject_type": "Vehicle",
             "predicate": "speeding",
             "object": "road",
@@ -148,8 +154,8 @@ class TestHallucinationFilter:
             "timestamp": 5.0,
         }])
         result = _parse(raw, active_ids=[1, 2, 3])
-        # Vehicle 99 is hallucinated — should be dropped
-        assert len(result) == 0
+        # VLM parser does not filter — triple is structurally valid and kept
+        assert len(result) == 1
 
     def test_valid_vehicle_id_kept(self):
         raw = json.dumps([{

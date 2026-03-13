@@ -57,7 +57,7 @@ class TestKinematicEstimatorInit:
 class TestKinematicEstimatorUpdate:
     def test_update_returns_dict(self):
         est = KinematicEstimator(fps=30.0)
-        result = est.update({1: [0.0, 0.0, 0, 0, 0, 0]})
+        result = est.update({1: (0.0, 0.0)})
         # update() returns state_vectors dict
         assert isinstance(result, dict)
 
@@ -65,20 +65,20 @@ class TestKinematicEstimatorUpdate:
         est = KinematicEstimator(fps=30.0)
         # Feed enough frames to fill the Savitzky-Golay window (default=15)
         for f in range(20):
-            est.update({1: [float(f), 0.0, 0, 0, 0, 0]})
+            est.update({1: (float(f), 0.0)})
         assert 1 in est.warm_tracks
 
     def test_new_track_not_warm_yet(self):
         est = KinematicEstimator(fps=30.0)
-        est.update({1: [0.0, 0.0, 0, 0, 0, 0]})
+        est.update({1: (0.0, 0.0)})
         assert 1 not in est.warm_tracks
 
     def test_multiple_tracks_independent(self):
         est = KinematicEstimator(fps=30.0)
         for f in range(20):
             est.update({
-                1: [float(f),        0.0, 0, 0, 0, 0],
-                2: [float(f) * 2.0,  0.0, 0, 0, 0, 0],
+                1: (float(f),       0.0),
+                2: (float(f) * 2.0, 0.0),
             })
         assert 1 in est.warm_tracks
         assert 2 in est.warm_tracks
@@ -87,21 +87,21 @@ class TestKinematicEstimatorUpdate:
         """A track moving right (increasing x) should have positive vel_x."""
         est = KinematicEstimator(fps=30.0)
         for f in range(25):
-            est.update({1: [float(f * 5), 0.0, 0, 0, 0, 0]})
-        result = est.update({1: [float(25 * 5), 0.0, 0, 0, 0, 0]})
-        if 1 in result and result[1] is not None:
-            vx = result[1][2]
-            assert vx > 0, f"Expected positive vel_x, got {vx}"
+            est.update({1: (float(f * 5), 0.0)})
+        result = est.update({1: (float(25 * 5), 0.0)})
+        assert 1 in result, "Track 1 should be in result"
+        vx = result[1][2]
+        assert vx > 0, f"Expected positive vel_x, got {vx}"
 
     def test_stale_track_pruned(self):
         """A track absent for more than MAX_MISSED_FRAMES should be removed."""
         est = KinematicEstimator(fps=30.0)
         # Feed track 1 for 20 frames
         for f in range(20):
-            est.update({1: [float(f), 0.0, 0, 0, 0, 0]})
+            est.update({1: (float(f), 0.0)})
         # Now stop feeding track 1; feed only track 2 for many frames
         for f in range(20):
-            est.update({2: [float(f), 0.0, 0, 0, 0, 0]})
+            est.update({2: (float(f), 0.0)})
         # Track 1 should have been pruned (missed > MAX_MISSED_FRAMES=5)
         assert 1 not in est.warm_tracks
 
@@ -114,7 +114,34 @@ class TestKinematicEstimatorUpdate:
         """Warm track output must have 6 elements: [x, y, vx, vy, ax, ay]."""
         est = KinematicEstimator(fps=30.0)
         for f in range(25):
-            est.update({1: [float(f), 0.0, 0, 0, 0, 0]})
-        result = est.update({1: [25.0, 0.0, 0, 0, 0, 0]})
-        if 1 in result and result[1] is not None:
-            assert len(result[1]) == 6
+            est.update({1: (float(f), 0.0)})
+        result = est.update({1: (25.0, 0.0)})
+        assert 1 in result, "Track 1 should be in result after warm-up"
+        assert len(result[1]) == 6
+
+    def test_gap_interpolation_keeps_track_alive(self):
+        """Track reappearing within MAX_MISSED_FRAMES should stay warm."""
+        from src.physics_engine.kinematics import MAX_MISSED_FRAMES
+        est = KinematicEstimator(fps=30.0)
+        for f in range(20):
+            est.update({1: (float(f), 0.0)})
+        # Miss exactly MAX_MISSED_FRAMES frames (track 2 only)
+        for _ in range(MAX_MISSED_FRAMES):
+            est.update({2: (0.0, 0.0)})
+        # Reappear — track should still be warm and trajectory intact
+        result = est.update({1: (25.0, 0.0)})
+        assert 1 in result, "Track should survive a short gap"
+        assert 1 in est.warm_tracks
+
+    def test_collision_suspected_alert_fires(self):
+        """Two vehicles < 2 m apart should trigger COLLISION_SUSPECTED."""
+        from src.symbolic_engine.alert_engine import AlertEngine, COLLISION_THRESHOLD_M
+        fired = []
+        engine = AlertEngine(on_alert=fired.append, cooldown_secs=0.0)
+        state = {
+            1: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            2: [1.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+        }
+        real_coords = {1: (0.0, 0.0), 2: (COLLISION_THRESHOLD_M - 0.5, 0.0)}
+        engine.check(state, real_coords, timestamp=1.0, frame_id=30)
+        assert any(a.alert_type == "COLLISION_SUSPECTED" for a in fired)

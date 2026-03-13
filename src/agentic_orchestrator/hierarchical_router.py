@@ -23,6 +23,9 @@ _FULL_ANALYSIS_PROTOTYPES = [
     "Were any traffic rules violated at the intersection?",
     "Did any vehicle make an illegal turn or maneuver?",
     "Was any vehicle driving on the wrong side of the road?",
+    "List all traffic rule violations detected in the video.",
+    "Was there a collision between Vehicle 2 and Vehicle 5?",
+    "Did Vehicle 2 collide with Vehicle 5?",
 ]
 
 _SEMANTIC_LOOKUP_PROTOTYPES = [
