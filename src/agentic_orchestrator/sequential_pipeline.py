@@ -26,11 +26,12 @@ Agents and their roles
                             observes results, and repeats until it can answer.
 
 5. tools       (Neuro-Symbolic)  Executes the tool the LLM called:
-                 search_semantic_events    → Milvus ANN search  (neural)
-                 query_graph_relationships → Kùzu Cypher        (symbolic)
-                 verify_physics_math       → DuckDB raw stats   (symbolic)
-                 evaluate_traffic_rules    → Rule engine        (symbolic) ← NEW
-                 query_zone_flow           → DuckDB OD analysis (symbolic)
+                 search_semantic_events    → Milvus ANN (event-level)    (neural)
+                 search_entity_profiles    → Milvus ANN (vehicle-level)  (neural)
+                 query_graph_relationships → Kùzu Cypher                 (symbolic)
+                 verify_physics_math       → DuckDB raw stats            (symbolic)
+                 evaluate_traffic_rules    → Rule engine                 (symbolic)
+                 query_zone_flow           → DuckDB OD analysis          (symbolic)
 
 6. finalize    (Symbolic)   Extracts the last AIMessage as the final answer
                             and exposes it as state['final_summary'].
@@ -51,6 +52,7 @@ from .langgraph_state import AgentState
 from .hierarchical_router import _classify_intent
 from .tools import (
     search_semantic_events,
+    search_entity_profiles,
     query_graph_relationships,
     verify_physics_math,
     query_zone_flow,
@@ -63,12 +65,13 @@ from .tools import (
 # ---------------------------------------------------------------------------
 TOOLS_FULL = [
     search_semantic_events,
+    search_entity_profiles,   # Vehicle-level longitudinal behavioral profiles
     query_graph_relationships,
     verify_physics_math,
     evaluate_traffic_rules,   # Symbolic Rule Engine
     query_zone_flow,
 ]
-TOOLS_SEMANTIC = [search_semantic_events]
+TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
 # ---------------------------------------------------------------------------
 # System prompts — tailored per intent class.
@@ -77,47 +80,57 @@ _SYSTEM_PROMPT_FULL = """You are an expert traffic safety analyst with access to
 Neuro-Symbolic analysis system.
 
 Available tools:
-1. search_semantic_events      — Semantic search over VLM-generated event descriptions (Milvus).
-                                 ALWAYS call this first; it returns matching events and their
-                                 time_window_pointer (e.g. '10.0-15.0').
+1. search_semantic_events      — Semantic search over VLM-generated EVENT descriptions (Milvus).
+                                 Finds specific events in specific time windows.
+                                 Returns time_window_pointer (e.g. '10.0-15.0') for further queries.
+                                 Use for: "what happened at t=10s?", "find a near-miss event".
 
-2. query_graph_relationships   — Structural graph query (Kùzu, Cypher).
-                                 Use the time_window from step 1 to find which entities interacted.
+2. search_entity_profiles      — Behavioral profile search over per-VEHICLE longitudinal summaries.
+                                 Searches summaries accumulated over the full video.
+                                 Use for: "which vehicle was most aggressive?", "find the speeder",
+                                 "which vehicle hard-braked the most throughout the video?".
+                                 Returns: track_id, summary, first_seen, last_seen.
+
+3. query_graph_relationships   — Structural graph query (Kùzu, Cypher).
+                                 Use the time_window from tool 1 to find which entities interacted.
                                  Node labels: Vehicle, Pedestrian, Infrastructure.
                                  Example: MATCH (s)-[r:INTERACTS_WITH]->(o)
                                           WHERE r.trajectory_time_window = '10.0-15.0'
                                           RETURN s.name, r.predicate, o.name
 
-3. verify_physics_math         — Raw kinematic statistics (DuckDB).
-                                 Returns max speed and minimum acceleration for a time window.
-                                 Use for quick numeric lookups.
+4. verify_physics_math         — Raw kinematic statistics (DuckDB).
+                                 Returns max speed and minimum signed acceleration for a window.
+                                 Use for quick numeric lookups or cross-checking rule engine results.
 
-4. evaluate_traffic_rules      — Symbolic Rule Engine (deterministic, auditable).
+5. evaluate_traffic_rules      — Symbolic Rule Engine (deterministic, auditable).
                                  Use this to CHECK FOR VIOLATIONS: speeding, hard braking,
-                                 aggressive acceleration. Rules are explicit — each result
-                                 includes the exact evidence values that triggered the rule.
+                                 aggressive acceleration. Each result includes exact evidence values.
                                  Always cite the 'evidence' field in your final answer.
 
-5. query_zone_flow             — Zone entry/exit counts and OD (Origin-Destination) pairs.
+6. query_zone_flow             — Zone entry/exit counts and OD (Origin-Destination) pairs.
                                  Use for flow, counts, gate entry/exit, dwell time, OD matrix.
 
 Decision rules:
-- Safety/violation questions ("did it brake hard?", "was it speeding?"): tools 1 → 4.
-- Relational questions ("which vehicles interacted?"): tools 1 → 2.
-- Combined safety + relationships: tools 1 → 2 → 4.
-- Full incident reconstruction: tools 1 → 2 → 4 → 3 (raw stats for extra context).
-- Flow/count/OD questions: tool 5 directly.
+- Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
+- Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5.
+- Relational questions ("which vehicles interacted?"): tools 1 → 3.
+- Combined safety + relationships: tools 1 → 3 → 5.
+- Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
+- Flow/count/OD questions: tool 6 directly.
 - Always cite the tool output that supports each claim in your final answer.
 - Base your final answer strictly on what the tools returned. Do not invent facts."""
 
 _SYSTEM_PROMPT_SEMANTIC = """You are an expert traffic safety analyst.
 
-You have one tool available:
-1. search_semantic_events — Searches VLM-generated event descriptions from the video.
-                            Use this to find relevant events and summarise what happened.
+You have two tools available:
+1. search_semantic_events  — Searches VLM-generated event descriptions (frame-level).
+                             Use to find specific events and summarise what happened.
+2. search_entity_profiles  — Searches per-vehicle longitudinal behavioral summaries.
+                             Use for "which vehicle was most aggressive?" type questions.
 
-Call search_semantic_events with the user's query.
-Base your final answer strictly on what the tool returned. Do not invent facts."""
+Choose the appropriate tool based on whether the query is about a specific event
+or about a vehicle's overall behaviour across the video.
+Base your final answer strictly on what the tools returned. Do not invent facts."""
 
 # ---------------------------------------------------------------------------
 # Planner prompt — produces an explicit investigation plan before ReAct.
@@ -126,8 +139,8 @@ _PLANNER_PROMPT = (
     "You are a traffic analysis planning system. "
     "Decompose the following query into a concrete, ordered investigation plan (3-5 steps max).\n\n"
     "For each step specify which tool to use and what specific data to look for.\n\n"
-    "Available tools: search_semantic_events, query_graph_relationships, "
-    "verify_physics_math, evaluate_traffic_rules, query_zone_flow\n\n"
+    "Available tools: search_semantic_events, search_entity_profiles, "
+    "query_graph_relationships, verify_physics_math, evaluate_traffic_rules, query_zone_flow\n\n"
     "Query: {query}\n\n"
     "Output a numbered list only. Be specific and concise."
 )

@@ -1,8 +1,10 @@
 import cv2
+import logging
 import time
 import json
 from collections import deque
 from pathlib import Path
+from typing import Optional
 from PIL import Image
 import numpy as np
 
@@ -24,12 +26,22 @@ from src.memory_layer.milvus_client import SemanticVectorStore
 from src.memory_layer.graph_client import GraphClient
 
 # --- Phase 4: Agentic Orchestrator ---
-from src.agentic_orchestrator.sequential_pipeline import agent_app
+from src.agentic_orchestrator.sequential_pipeline import agent_app, AGENT_INVOKE_CONFIG
 
 # --- Phase 5: Alert Engine (optional) ---
 from src.symbolic_engine.alert_engine import AlertEngine, TrafficAlert
 
-def process_video(video_path: str, progress_callback=None, alert_callback=None):
+# --- Phase 6: Evaluation Metrics ---
+from src.evaluation.metrics import MetricsCollector, time_operation
+
+log = logging.getLogger(__name__)
+
+def process_video(
+    video_path: str,
+    progress_callback=None,
+    alert_callback=None,
+    metrics: Optional[MetricsCollector] = None,
+):
     """
     Executes the dual-loop Neuro-Symbolic tracking and abstraction pipeline.
     High-frequency loop runs every frame. Low-frequency loop runs at ~3 VLM
@@ -42,10 +54,13 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
         alert_callback:     Optional callable(alert: TrafficAlert) invoked in
                             real-time whenever a kinematic threshold is crossed.
                             When None, the alert engine is disabled entirely.
+        metrics:            Optional MetricsCollector that records proxy evaluation
+                            metrics (VLM quality, DB latency, alert distribution).
+                            Call metrics.log_summary() after this function returns.
     """
     # Reset per-call state stored on the function object
     process_video._prev_window_ptr = None
-    print("Initializing Neuro-Symbolic Pipeline...")
+    log.info("Initializing Neuro-Symbolic Pipeline...")
 
     # 1. Open Video Stream FIRST to read actual fps and frame count.
     #    fps drives every kinematic calculation — using the wrong value
@@ -58,7 +73,8 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     # Run VLM ~3 times per second regardless of source frame rate.
     semantic_interval = max(1, fps // 3)
-    print(f"Video: {fps} fps | {total_frames} frames | VLM every {semantic_interval} frames (~3/sec)")
+    log.info("Video: %d fps | %d frames | VLM every %d frames (~3/sec)",
+             fps, total_frames, semantic_interval)
 
     # 2. Initialize Hybrid Databases
     duckdb_client = DuckDBClient()
@@ -98,10 +114,12 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
             _flags["force_vlm"] = True
         if alert_callback:
             alert_callback(alert)
+        if metrics is not None:
+            metrics.record_alert_fired(alert.alert_type)
 
     alert_engine = AlertEngine(on_alert=_alert_handler) if alert_callback else None
     if alert_engine:
-        print("Alert engine active — real-time kinematic alerts + forced VLM on critical events.")
+        log.info("Alert engine active — real-time kinematic alerts + forced VLM on critical events.")
 
     # --- Entity profile tracking -----------------------------------------
     # Accumulates first_seen timestamp per vehicle for entity_profiles.
@@ -113,7 +131,8 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
     if Path("zone_config.json").exists():
         zone_config = ZoneConfig.from_json("zone_config.json")
         zone_manager = ZoneManager(zone_config)
-        print(f"Zone '{zone_config.zone_id}' active — gates: {[g.name for g in zone_config.gates]}")
+        log.info("Zone '%s' active — gates: %s",
+                 zone_config.zone_id, [g.name for g in zone_config.gates])
 
     # 4. Initialize Semantic Abstractor (Macro-Loop)
     renderer = AdaptiveRenderer()
@@ -122,8 +141,10 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
 
     frame_id = 0
     start_time = time.time()
+    if metrics is not None:
+        metrics.begin()
 
-    print("\n--- Starting Video Processing ---")
+    log.info("--- Starting Video Processing ---")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -173,12 +194,25 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
             )
             for event in crossing_events:
                 duckdb_client.insert_crossing_event(event)
-                print(f"[{timestamp:.1f}s] Vehicle {event.track_id} → {event.direction} via {event.gate_name}")
+                log.info("[%.1fs] Vehicle %d → %s via %s",
+                         timestamp, event.track_id, event.direction, event.gate_name)
 
         # ==========================================
         # THE MACRO-LOOP (Low-Frequency Semantics)
         # ==========================================
-        
+
+        # Detect interval frames that get skipped by the motion gate (for metrics).
+        _is_interval_frame = (
+            frame_id > 0
+            and len(tracked_boxes) > 0
+            and frame_id % semantic_interval == 0
+        )
+        if (metrics is not None
+                and _is_interval_frame
+                and _motion_score < MOTION_SKIP_THRESHOLD
+                and not _flags["force_vlm"]):
+            metrics.record_motion_skip()
+
         # MACRO-LOOP condition:
         #   - Fixed interval: every semantic_interval frames (~3/sec)
         #   - OR forced: when AlertEngine flagged a critical event this frame
@@ -195,9 +229,12 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
         )
 
         if _run_macro:
+            _force_was_set = _flags["force_vlm"]
             _flags["force_vlm"] = False
-            print(f"[{timestamp:.1f}s] Running Semantic Abstraction "
-                  f"(motion={_motion_score:.1f}, frames={len(_som_buffer)+1})...")
+            if metrics is not None and _force_was_set:
+                metrics.record_force_vlm()
+            log.debug("[%.1fs] Running Semantic Abstraction (motion=%.1f, frames=%d)...",
+                      timestamp, _motion_score, len(_som_buffer) + 1)
 
             HISTORY_WINDOW_SECS = 5.0
             chunk_start = max(0.0, timestamp - HISTORY_WINDOW_SECS)
@@ -222,14 +259,21 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
             # video clip (frame-list format + fps).  The model uses MRoPE
             # temporal position encoding to understand motion across frames.
             # Single-frame fallback if buffer only has 1 entry (early in video).
-            vlm_triples = vlm.generate_scene_graph_triples(
-                list(_som_buffer),
-                timestamp,
-                state_vectors,
-                kinematics.warm_tracks,
-                behavior_summary=behavior_summary,
-                fps=3.0,  # VLM sample rate: semantic_interval ≈ fps/3
-            )
+            with time_operation() as _vlm_timer:
+                vlm_triples = vlm.generate_scene_graph_triples(
+                    list(_som_buffer),
+                    timestamp,
+                    state_vectors,
+                    kinematics.warm_tracks,
+                    behavior_summary=behavior_summary,
+                    fps=3.0,  # VLM sample rate: semantic_interval ≈ fps/3
+                )
+            if metrics is not None:
+                metrics.record_vlm_call(
+                    latency_ms=_vlm_timer.elapsed_ms,
+                    parse_success=bool(vlm_triples),
+                    triple_count=len(vlm_triples) if vlm_triples else 0,
+                )
 
             if vlm_triples:
                 # NL for Milvus (better embeddings than JSON syntax)
@@ -237,9 +281,12 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
                     f"{t['subject']} {t['predicate']} {t['object']}."
                     for t in vlm_triples
                 )
-                milvus_client.insert_event_chunk(
-                    nl_description, chunk_start, timestamp, frame_id
-                )
+                with time_operation() as _milvus_timer:
+                    milvus_client.insert_event_chunk(
+                        nl_description, chunk_start, timestamp, frame_id
+                    )
+                if metrics is not None:
+                    metrics.record_milvus_insert(_milvus_timer.elapsed_ms)
 
                 # JSON for EntityExtractor (qwen2.5:72b needs SPO keys)
                 scene_description = json.dumps(vlm_triples)
@@ -249,7 +296,10 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
                     # Previous window for PRECEDES edge (None on first tick)
                     prev_window_ptr = getattr(process_video, "_prev_window_ptr", None)
 
-                    graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
+                    with time_operation() as _graph_timer:
+                        graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
+                    if metrics is not None:
+                        metrics.record_graph_insert(_graph_timer.elapsed_ms)
 
                     # Insert PRECEDES temporal edges linking this window to the last
                     if prev_window_ptr is not None:
@@ -285,20 +335,27 @@ def process_video(video_path: str, progress_callback=None, alert_callback=None):
         if progress_callback is not None:
             progress_callback(frame_id, total_frames)
 
+        if metrics is not None:
+            metrics.record_frame()
+
         frame_id += 1
 
     cap.release()
-    print(f"--- Video Processing Complete in {time.time() - start_time:.2f}s ---")
-    
+    log.info("--- Video Processing Complete in %.2fs ---", time.time() - start_time)
+
     # Safely close database connections
     duckdb_client.close()
     milvus_client.close()
     graph_client.close()
 
+    if metrics is not None:
+        metrics.end()
+        metrics.log_summary()
+
 def interactive_agent_loop():
     """Boots up the LangGraph agent to query the processed hybrid databases."""
     print("\n=============================================")
-    print("🧠 Neuro-Symbolic Agentic Brain Initialized")
+    print("Neuro-Symbolic Agentic Brain Initialized")
     print("=============================================")
     print("Ask questions about the traffic event (e.g., 'Did Vehicle 4 brake too hard?').")
     print("Type 'exit' to quit.\n")
@@ -307,10 +364,10 @@ def interactive_agent_loop():
         query = input("User >> ")
         if query.lower() in ['exit', 'quit']:
             break
-            
+
         initial_state = {"query": query}
-        final_state = agent_app.invoke(initial_state)
-        
+        final_state = agent_app.invoke(initial_state, AGENT_INVOKE_CONFIG)
+
         print(f"\nAgent >> {final_state.get('final_summary', 'No summary generated.')}\n")
 
 if __name__ == "__main__":

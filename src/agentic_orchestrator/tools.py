@@ -1,14 +1,15 @@
 """
 LangGraph Agent Tools — Neuro-Symbolic Bridge
 ==============================================
-Five LangChain tools that expose the hybrid memory layer to the ReAct agent.
+Six LangChain tools that expose the hybrid memory layer to the ReAct agent.
 Each tool maps to a distinct reasoning modality:
 
-  search_semantic_events    → Milvus ANN search       (neural)
-  query_graph_relationships → Kùzu Cypher traversal   (symbolic)
-  verify_physics_math       → DuckDB kinematic stats  (symbolic)
-  evaluate_traffic_rules    → Rule Engine              (symbolic / deterministic)
-  query_zone_flow           → DuckDB OD analysis      (symbolic)
+  search_semantic_events    → Milvus ANN search (event-level)  (neural)
+  search_entity_profiles    → Milvus ANN search (vehicle-level) (neural)
+  query_graph_relationships → Kùzu Cypher traversal            (symbolic)
+  verify_physics_math       → DuckDB kinematic stats           (symbolic)
+  evaluate_traffic_rules    → Rule Engine                      (symbolic / deterministic)
+  query_zone_flow           → DuckDB OD analysis               (symbolic)
 
 Tools are lazy-initialised: DB connections open on first use, not at
 import time, so the FastAPI server starts cleanly even when a DB is not
@@ -59,6 +60,36 @@ def _get_duckdb() -> DuckDBClient:
 # ---------------------------------------------------------------------------
 # Tool 1 — Neural semantic search (Milvus)
 # ---------------------------------------------------------------------------
+
+@tool
+def search_entity_profiles(query: str) -> str:
+    """
+    Behavioral Profile Search over per-vehicle longitudinal summaries (Milvus entity_profiles).
+
+    Use this tool for global behavioral queries that span the FULL video, such as:
+      - "Which vehicle was speeding the most?"
+      - "Find the most aggressive driver."
+      - "Which vehicle hard-braked the most times?"
+
+    Unlike search_semantic_events (which finds specific frame-level events),
+    this tool searches longitudinal summaries accumulated over the entire video,
+    one per vehicle.  It answers ENTITY-LEVEL questions, not EVENT-LEVEL questions.
+
+    Pass the user's natural language behavioral description directly.
+
+    Returns a list with: similarity_score, track_id, summary, first_seen, last_seen.
+    """
+    log.info("Tool: search_entity_profiles | query='%s'", query)
+    results = _get_milvus().search_entity_profiles(query, top_k=3)
+
+    if not results:
+        return (
+            "No entity profiles found. "
+            "Ensure the video has been processed and vehicles were observed."
+        )
+
+    return json.dumps(results, indent=2)
+
 
 @tool
 def search_semantic_events(query: str) -> str:

@@ -1,7 +1,10 @@
+import logging
 from pathlib import Path
 from typing import List, Dict, Any
 from pymilvus import MilvusClient
 from sentence_transformers import SentenceTransformer
+
+log = logging.getLogger(__name__)
 
 # Collection names
 _EVENTS_COLLECTION   = "traffic_events"    # frame-level VLM event descriptions
@@ -36,7 +39,7 @@ class SemanticVectorStore:
         self.client = MilvusClient(db_path)
         self.collection_name = collection_name
 
-        print("Loading SentenceTransformer embedding model...")
+        log.info("Loading SentenceTransformer embedding model...")
         self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.dim = 384
 
@@ -46,7 +49,7 @@ class SemanticVectorStore:
     def _initialize_collection(self) -> None:
         """Creates the traffic_events collection if it doesn't already exist."""
         if not self.client.has_collection(self.collection_name):
-            print(f"Creating Milvus collection: {self.collection_name}")
+            log.info("Creating Milvus collection: %s", self.collection_name)
             self.client.create_collection(
                 collection_name=self.collection_name,
                 dimension=self.dim,
@@ -56,7 +59,7 @@ class SemanticVectorStore:
     def _initialize_entity_profiles(self) -> None:
         """Creates the entity_profiles collection if it doesn't already exist."""
         if not self.client.has_collection(_PROFILES_COLLECTION):
-            print(f"Creating Milvus collection: {_PROFILES_COLLECTION}")
+            log.info("Creating Milvus collection: %s", _PROFILES_COLLECTION)
             self.client.create_collection(
                 collection_name=_PROFILES_COLLECTION,
                 dimension=self.dim,
