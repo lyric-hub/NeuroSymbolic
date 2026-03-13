@@ -112,6 +112,8 @@ def process_video(
     def _alert_handler(alert) -> None:
         if alert.alert_type in ("COLLISION_SUSPECTED", "HARD_BRAKING"):
             _flags["force_vlm"] = True
+        # Fix 4: persist every alert to DuckDB immediately (direct INSERT, no buffer).
+        duckdb_client.insert_alert(alert)
         if alert_callback:
             alert_callback(alert)
         if metrics is not None:
@@ -170,9 +172,12 @@ def process_video(
         # 4. Stream to Analytical Database
         duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors)
 
-        # 5. Real-time alerts (skipped when no alert_callback was provided)
+        # 5. Real-time alerts (skipped when no alert_callback was provided).
+        # Fix 5: only pass warm tracks to the alert engine — cold tracks (< 15 frames)
+        # have zero acceleration from finite differences and would produce false alerts.
         if alert_engine is not None:
-            alert_engine.check(state_vectors, real_coords, timestamp, frame_id)
+            warm_sv = {k: v for k, v in state_vectors.items() if k in kinematics.warm_tracks}
+            alert_engine.check(warm_sv, real_coords, timestamp, frame_id)
 
         # 6. Motion-energy score for VLM gating (cheap, runs every frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -290,7 +295,8 @@ def process_video(
 
                 # JSON for EntityExtractor (qwen2.5:72b needs SPO keys)
                 scene_description = json.dumps(vlm_triples)
-                validated_triples = extractor.extract_triples(scene_description, timestamp)
+                # Fix 3: pass active track IDs so hallucinated vehicle IDs are filtered.
+                validated_triples = extractor.extract_triples(scene_description, timestamp, set(active_ids))
 
                 if validated_triples:
                     # Previous window for PRECEDES edge (None on first tick)

@@ -17,6 +17,12 @@ _FULL_ANALYSIS_PROTOTYPES = [
     "Did vehicle 2 perform an emergency stop?",
     "What is the maximum speed recorded for vehicle 5?",
     "How hard did vehicle 6 decelerate?",
+    # Fix 7: add traffic rule violation prototypes so queries like "ran a red light"
+    # correctly route to full_analysis and reach the evaluate_traffic_rules tool.
+    "Did any vehicle run a red light?",
+    "Were any traffic rules violated at the intersection?",
+    "Did any vehicle make an illegal turn or maneuver?",
+    "Was any vehicle driving on the wrong side of the road?",
 ]
 
 _SEMANTIC_LOOKUP_PROTOTYPES = [

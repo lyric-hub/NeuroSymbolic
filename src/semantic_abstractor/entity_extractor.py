@@ -10,7 +10,7 @@ graph storage stage.  Every triple written to Kùzu passes through here.
 
 import json
 import logging
-from typing import List, Literal
+from typing import List, Literal, Optional, Set
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
@@ -112,13 +112,22 @@ class EntityExtractor:
             format_instructions=self._parser.get_format_instructions()
         )
 
-    def extract_triples(self, raw_vlm_text: str, current_time: float) -> List[dict]:
+    def extract_triples(
+        self,
+        raw_vlm_text: str,
+        current_time: float,
+        active_track_ids: Optional[Set[int]] = None,
+    ) -> List[dict]:
         """
         Parse raw VLM output into validated SPO dicts for Kùzu insertion.
 
         Args:
-            raw_vlm_text: JSON string or free-text from vlm_inference.py.
-            current_time:  Video timestamp in seconds (used only for logging).
+            raw_vlm_text:      JSON string or free-text from vlm_inference.py.
+            current_time:      Video timestamp in seconds (used only for logging).
+            active_track_ids:  Set of integer track IDs visible in the current frame.
+                               When provided, triples referencing Vehicle IDs not in
+                               this set are dropped — preventing hallucinated ghost
+                               nodes from entering the graph.
 
         Returns:
             List of validated triple dicts (may be empty on parse failure).
@@ -138,6 +147,23 @@ class EntityExtractor:
                 self._llm.invoke(messages).content
             )
             triples = result.get("triples", [])
+
+            # Fix 3: filter out triples where the VLM hallucinated a Vehicle ID
+            # that does not exist in the current tracked frame.
+            if active_track_ids is not None:
+                before = len(triples)
+                triples = [
+                    t for t in triples
+                    if self._entity_id_valid(t.get("subject", ""), t.get("subject_type", ""), active_track_ids)
+                    and self._entity_id_valid(t.get("object", ""), t.get("object_type", ""), active_track_ids)
+                ]
+                dropped = before - len(triples)
+                if dropped:
+                    log.warning(
+                        "Dropped %d triple(s) with hallucinated Vehicle IDs at t=%.2fs",
+                        dropped, current_time,
+                    )
+
             log.debug("Extracted %d triples at t=%.2fs", len(triples), current_time)
             return triples
 
@@ -147,6 +173,23 @@ class EntityExtractor:
                 current_time,
             )
             return []
+
+    @staticmethod
+    def _entity_id_valid(name: str, entity_type: str, active_ids: Set[int]) -> bool:
+        """
+        Returns True if the entity is valid for the current frame.
+        Non-vehicle entities (Infrastructure, Pedestrian) always pass.
+        Vehicle entities must have a numeric ID present in active_ids.
+        """
+        if entity_type != "Vehicle":
+            return True
+        parts = name.strip().split()
+        if len(parts) < 2:
+            return False
+        try:
+            return int(parts[-1]) in active_ids
+        except ValueError:
+            return False
 
 
 # ---------------------------------------------------------------------------

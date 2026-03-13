@@ -1,3 +1,4 @@
+import json as _json
 from pathlib import Path
 from typing import Dict, List
 import duckdb
@@ -63,6 +64,20 @@ class DuckDBClient:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_zone_gate
             ON zone_crossings(zone_id, gate_name, timestamp)
+        """)
+
+        # Fix 4: persist real-time alerts so they survive beyond the in-memory
+        # deque(maxlen=200) in api.py and are queryable after processing.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS traffic_alerts (
+                timestamp  DOUBLE,
+                frame_id   UINTEGER,
+                alert_type VARCHAR,
+                severity   VARCHAR,
+                track_id   INTEGER,
+                message    VARCHAR,
+                evidence   VARCHAR
+            )
         """)
 
     def insert_state_vectors(self, timestamp: float, frame_id: int, state_vectors: Dict[int, List[float]]):
@@ -331,6 +346,27 @@ class DuckDBClient:
         od_pairs = od_df.to_dict(orient="records")
 
         return {"gate_counts": gate_counts, "od_pairs": od_pairs}
+
+    def insert_alert(self, alert) -> None:
+        """
+        Persists a single TrafficAlert to the traffic_alerts table immediately
+        (no buffering — alerts are rare and must survive a crash).
+
+        Args:
+            alert: A TrafficAlert dataclass instance from AlertEngine.
+        """
+        self.conn.execute(
+            "INSERT INTO traffic_alerts VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                alert.timestamp,
+                alert.frame_id,
+                alert.alert_type,
+                alert.severity,
+                alert.track_id,
+                alert.message,
+                _json.dumps(alert.evidence),
+            ),
+        )
 
     def close(self) -> None:
         """Flushes any remaining buffered rows and closes the database connection."""

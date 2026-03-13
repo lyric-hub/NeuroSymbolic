@@ -43,6 +43,11 @@ class SemanticVectorStore:
         self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.dim = 384
 
+        # Fix 8: cache last-inserted summary per vehicle to suppress duplicate inserts.
+        # upsert_entity_profile is called every macro-loop tick; without this a 5-min
+        # video generates hundreds of identical profile vectors per vehicle.
+        self._profile_cache: dict = {}
+
         self._initialize_collection()
         self._initialize_entity_profiles()
 
@@ -126,7 +131,9 @@ class SemanticVectorStore:
             for hit in hits:
                 entity = hit.get("entity", {})
                 formatted_results.append({
-                    "similarity_score": hit.get("distance"),
+                    # Fix 1: Milvus returns L2 distance (lower = more similar).
+                    # Convert to a 0–1 similarity score so the agent ranks correctly.
+                    "similarity_score": round(1.0 / (1.0 + hit.get("distance", 1.0)), 4),
                     "description": entity.get("text"),
                     "time_window": entity.get("time_window_pointer"),
                     "frame_id": entity.get("frame_id"),
@@ -168,6 +175,10 @@ class SemanticVectorStore:
         """
         if not summary.strip():
             return
+        # Fix 8: skip insert if summary text hasn't changed since last call for this vehicle.
+        if self._profile_cache.get(track_id) == summary:
+            return
+        self._profile_cache[track_id] = summary
         embedding = self.embedding_model.encode(summary).tolist()
         self.client.insert(
             collection_name=_PROFILES_COLLECTION,
@@ -213,7 +224,8 @@ class SemanticVectorStore:
             for hit in hits:
                 entity = hit.get("entity", {})
                 formatted.append({
-                    "similarity_score": hit.get("distance"),
+                    # Fix 1: same L2→similarity conversion as search_semantic_events.
+                    "similarity_score": round(1.0 / (1.0 + hit.get("distance", 1.0)), 4),
                     "track_id":   entity.get("track_id"),
                     "summary":    entity.get("summary"),
                     "first_seen": entity.get("first_seen"),

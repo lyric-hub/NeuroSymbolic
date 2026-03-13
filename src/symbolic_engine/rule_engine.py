@@ -113,6 +113,11 @@ class TrafficRuleEngine:
         df = df.copy()
         df["speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
         df["accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
+        # Fix 6: direction-aware signed acceleration — same formula as AlertEngine.
+        # Uses dot(velocity, acceleration) to determine braking vs accelerating,
+        # so the rule fires correctly for vehicles braking at any heading angle.
+        _dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
+        df["signed_accel"] = df["accel_mag"].where(_dot >= 0, -df["accel_mag"])
 
         violations: List[RuleViolation] = []
         violations += self._check_speeding(df, track_id)
@@ -157,14 +162,15 @@ class TrafficRuleEngine:
     @staticmethod
     def _check_hard_braking(df: pd.DataFrame, track_id: int) -> List[RuleViolation]:
         """
-        HARD_BRAKING — deceleration below the threshold in the Y axis.
-        Road-aligned cameras capture forward/backward motion primarily in Y.
+        HARD_BRAKING — signed deceleration below the threshold.
+        Fix 6: uses direction-aware signed_accel (pre-computed in evaluate()) so
+        the rule fires for vehicles braking at any heading, not just Y-axis motion.
         """
-        braking = df[df["accel_y"] < HARD_BRAKING_THRESHOLD]
+        braking = df[df["signed_accel"] < HARD_BRAKING_THRESHOLD]
         if braking.empty:
             return []
 
-        min_accel = float(df["accel_y"].min())
+        min_accel = float(df["signed_accel"].min())
         return [RuleViolation(
             rule_id="HARD_BRAKING",
             description=(
