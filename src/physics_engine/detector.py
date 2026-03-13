@@ -453,22 +453,35 @@ def _load_yolo_model(weights: str) -> Any:
 
     weight_path = Path(weights).expanduser().resolve()
 
+    def _tensorrt_available() -> bool:
+        try:
+            import tensorrt  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
     if weight_path.suffix.lower() == ".engine":
+        if not _tensorrt_available():
+            raise RuntimeError(
+                f"Model {weight_path} is a TensorRT engine but the "
+                "'tensorrt' package is not installed. "
+                "Install it or pass the .pt weights path instead."
+            )
         logging.info(f"Loading TensorRT engine: {weight_path}")
         return YOLO(str(weight_path), task="detect")
 
-    # If .pt given, prefer engine sibling
+    # If .pt given, prefer engine sibling only when TensorRT is available
     engine_sibling = weight_path.with_suffix(".engine")
 
     if engine_sibling.exists():
-        logging.info(f"Found TensorRT engine: {engine_sibling}")
-        return YOLO(str(engine_sibling), task="detect")
+        if _tensorrt_available():
+            logging.info(f"Found TensorRT engine: {engine_sibling}")
+            return YOLO(str(engine_sibling), task="detect")
+        logging.info(
+            f"TensorRT engine found at {engine_sibling} but 'tensorrt' is "
+            "not installed — falling back to PyTorch model."
+        )
 
-    # Fall back to PyTorch model
-    logging.warning(
-        f"No TensorRT engine found for {weight_path}. "
-        "Falling back to PyTorch model."
-    )
     return YOLO(str(weight_path), task="detect")
 
 

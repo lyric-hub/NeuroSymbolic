@@ -1,9 +1,10 @@
-import os
+import logging
 from pathlib import Path
 from typing import List, Dict, Any
 import kuzu
 
 _VALID_ENTITY_TYPES = frozenset({"Vehicle", "Pedestrian", "Infrastructure"})
+log = logging.getLogger(__name__)
 
 class GraphClient:
     """
@@ -23,11 +24,16 @@ class GraphClient:
     def _initialize_schema(self):
         """
         Creates the graph schema using Cypher.
-        Typed node tables (Vehicle, Pedestrian, Infrastructure) allow the agent
-        to query by entity class (e.g. MATCH (v:Vehicle)) rather than filtering
-        a monolithic Entity table.
+
+        Node tables:
+          Vehicle, Pedestrian, Infrastructure — typed for class-filtered queries.
+
+        Relationship tables:
+          INTERACTS_WITH — cross-entity interactions with physics pointer.
+          PRECEDES       — same-vehicle temporal continuity across time windows.
+                           Enables "what did Vehicle 4 do before this event?"
+                           queries via Cypher path traversal.
         """
-        # Create a node table for each entity type
         for node_type in ("Vehicle", "Pedestrian", "Infrastructure"):
             try:
                 self.conn.execute(
@@ -36,9 +42,6 @@ class GraphClient:
             except RuntimeError:
                 pass  # Already exists
 
-        # One relationship table covering every cross-type interaction.
-        # All nine FROM/TO combinations are declared so the planner can route
-        # edges correctly regardless of the subject/object type pair.
         try:
             self.conn.execute("""
                 CREATE REL TABLE INTERACTS_WITH (
@@ -54,6 +57,26 @@ class GraphClient:
                     predicate STRING,
                     timestamp DOUBLE,
                     trajectory_time_window STRING
+                )
+            """)
+        except RuntimeError:
+            pass  # Already exists
+
+        # PRECEDES: temporal continuity edge on the same vehicle node.
+        # Self-edge (Vehicle → Vehicle with the same name) linking consecutive
+        # time windows. Properties encode which windows are connected and how
+        # much time elapsed between them, enabling temporal path queries:
+        #
+        #   MATCH (v:Vehicle {name:'Vehicle 4'})-[r:PRECEDES*1..4]->(v2)
+        #   RETURN r.from_window, r.to_window ORDER BY r.from_window
+        try:
+            self.conn.execute("""
+                CREATE REL TABLE PRECEDES (
+                    FROM Vehicle TO Vehicle,
+                    FROM Pedestrian TO Pedestrian,
+                    from_window    STRING,
+                    to_window      STRING,
+                    gap_seconds    DOUBLE
                 )
             """)
         except RuntimeError:
@@ -118,6 +141,58 @@ class GraphClient:
                     "window": time_window
                 }
             )
+
+    def insert_temporal_edges(
+        self,
+        vehicle_ids: List[int],
+        prev_window: str,
+        curr_window: str,
+        gap_seconds: float,
+    ) -> None:
+        """
+        Creates PRECEDES self-edges for vehicles present in two consecutive
+        time windows, encoding temporal continuity.
+
+        Called in the macro-loop after every successful VLM inference so
+        that every vehicle's trajectory is linked window-by-window through
+        the graph.
+
+        Example Cypher enabled by these edges:
+          -- "What was Vehicle 4 doing 10 seconds before the crash?"
+          MATCH (v:Vehicle {name:'Vehicle 4'})-[r:PRECEDES*1..3]->(v2)
+          WHERE r[-1].to_window = '10.0-15.0'
+          RETURN r[*].from_window, r[*].to_window
+
+        Args:
+            vehicle_ids: Integer track IDs of vehicles active in both windows.
+            prev_window: Time-window string of the previous macro-loop tick
+                         (e.g. "5.0-10.0").
+            curr_window: Time-window string of the current macro-loop tick
+                         (e.g. "10.0-15.0").
+            gap_seconds: Elapsed real time between the two windows (seconds).
+        """
+        for vid in vehicle_ids:
+            name = f"Vehicle {vid}"
+            self._upsert_entity(name, "Vehicle")
+            try:
+                self.conn.execute(
+                    """
+                    MATCH (v:Vehicle {name: $name})
+                    CREATE (v)-[:PRECEDES {
+                        from_window:  $from_w,
+                        to_window:    $to_w,
+                        gap_seconds:  $gap
+                    }]->(v)
+                    """,
+                    parameters={
+                        "name":   name,
+                        "from_w": prev_window,
+                        "to_w":   curr_window,
+                        "gap":    gap_seconds,
+                    },
+                )
+            except Exception as exc:
+                log.warning("PRECEDES edge failed for %s: %s", name, exc)
 
     def query_graph(self, cypher_query: str) -> List[Dict[str, Any]]:
         """
