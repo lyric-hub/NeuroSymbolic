@@ -84,7 +84,7 @@ class JobStatus(str, Enum):
 # Sufficient for single-process deployments; replace with Redis for multi-worker setups.
 job_registry: dict[str, dict] = {}
 
-def _run_job(job_id: str, video_path: str):
+def _run_job(job_id: str, video_path: str, run_physics: bool = True, run_vlm: bool = True, model_path: str | None = None):
     """Wrapper that updates job_registry around the blocking process_video call."""
     job_registry[job_id]["status"] = JobStatus.PROCESSING
 
@@ -97,6 +97,9 @@ def _run_job(job_id: str, video_path: str):
             video_path,
             progress_callback=on_progress,
             alert_callback=_on_pipeline_alert,
+            run_physics=run_physics,
+            run_vlm=run_vlm,
+            model_path=model_path or _latest_model(),
         )
         job_registry[job_id]["status"] = JobStatus.DONE
     except Exception as e:
@@ -121,22 +124,79 @@ class JobResponse(BaseModel):
 
 # --- Endpoints ---
 
-@app.post("/upload_video/", response_model=JobResponse, status_code=202)
-async def upload_and_process_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+MODELS_DIR = Path("models")
+
+def _latest_model() -> str:
+    """Returns the most-recently uploaded .pt in models/, else falls back to yolov8n.pt."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    pts = sorted(MODELS_DIR.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(pts[0]) if pts else "yolov8n.pt"
+
+
+@app.get("/models/")
+async def list_models():
+    """Lists available .pt model files in models/ and which one is active."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    pts = sorted(MODELS_DIR.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    models = [p.name for p in pts]
+    return {"models": models, "active": models[0] if models else "yolov8n.pt (default)"}
+
+
+@app.post("/upload_model/", status_code=201)
+async def upload_model(file: UploadFile = File(...)):
+    """Uploads a YOLO .pt weights file into models/. Becomes the active model immediately."""
+    if not (file.filename or "").endswith(".pt"):
+        raise HTTPException(status_code=400, detail="Only .pt files are accepted.")
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = MODELS_DIR / file.filename
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"filename": file.filename, "active": file.filename}
+
+
+class RunPhysicsRequest(BaseModel):
+    video_path: str        # relative path inside data/raw_videos/
+    run_physics: bool = True
+    run_vlm: bool = True
+
+
+@app.post("/run_physics/", response_model=JobResponse, status_code=202)
+async def run_physics(request: RunPhysicsRequest, background_tasks: BackgroundTasks):
     """
-    Uploads a video and starts background processing.
+    Start the physics pipeline on a video already in data/raw_videos/.
     Returns a job_id that can be polled via GET /job/{job_id}.
     """
-    if not file.filename.endswith(('.mp4', '.avi', '.mov')):
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    full_path = Path("data/raw_videos") / request.video_path
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail=f"Video not found: {request.video_path}")
 
-    # Prevent concurrent jobs — all three databases are single-writer.
     active = [j for j in job_registry.values() if j["status"] == JobStatus.PROCESSING]
     if active:
         raise HTTPException(
             status_code=409,
-            detail="A processing job is already running. Wait for it to finish before uploading another video.",
+            detail="A processing job is already running. Wait for it to finish.",
         )
+
+    job_id = str(uuid.uuid4())
+    job_registry[job_id] = {
+        "status": JobStatus.PENDING,
+        "filename": request.video_path,
+        "frames_processed": None,
+        "total_frames": None,
+        "error": None,
+    }
+    background_tasks.add_task(_run_job, job_id, str(full_path), request.run_physics, request.run_vlm, _latest_model())
+    return JobResponse(job_id=job_id, status=JobStatus.PENDING, filename=request.video_path)
+
+
+@app.post("/upload_video/", status_code=201)
+async def upload_video(file: UploadFile = File(...)):
+    """
+    Saves a video to data/raw_videos/ without starting any processing.
+    After uploading, use POST /run_physics/ to process it with the desired flags.
+    """
+    if not (file.filename or "").endswith(('.mp4', '.avi', '.mov')):
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
 
     save_path = Path(f"data/raw_videos/{file.filename}")
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,18 +204,7 @@ async def upload_and_process_video(background_tasks: BackgroundTasks, file: Uplo
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    job_id = str(uuid.uuid4())
-    job_registry[job_id] = {
-        "status": JobStatus.PENDING,
-        "filename": file.filename,
-        "frames_processed": None,
-        "total_frames": None,
-        "error": None,
-    }
-
-    background_tasks.add_task(_run_job, job_id, str(save_path))
-
-    return JobResponse(job_id=job_id, status=JobStatus.PENDING, filename=file.filename)
+    return {"filename": file.filename, "path": str(save_path)}
 
 
 @app.get("/job/{job_id}", response_model=JobResponse)
@@ -285,7 +334,7 @@ async def stream_video(
     palette = rng.integers(80, 255, size=(256, 3)).tolist()
 
     def _generate_frames():
-        detector = load_detector("models/best.pt", conf=conf)
+        detector = load_detector(_latest_model(), conf=conf)
         vt       = VehicleTracker(tracker_name=tracker)
         renderer = AdaptiveRenderer() if som else None
         ctx      = RenderContext() if som else None

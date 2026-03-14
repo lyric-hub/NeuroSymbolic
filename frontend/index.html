@@ -70,44 +70,69 @@
         <!-- ===== Dashboard View ===== -->
         <section class="view active" id="dashboardView">
 
-            <!-- Upload Card -->
-            <div class="card upload-card">
+            <!-- Model Upload Card -->
+            <div class="card model-card">
                 <div class="card-header">
-                    <h2>Upload Traffic Video</h2>
-                    <div class="chip" id="uploadStatusChip">Ready</div>
+                    <h2>Detection Model</h2>
+                    <div class="chip" id="modelStatusChip">Idle</div>
                 </div>
-                <div class="dropzone" id="dropzone">
-                    <div class="dropzone-content">
-                        <div class="dropzone-icon">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                                <polyline points="17 8 12 3 7 8"/>
-                                <line x1="12" y1="3" x2="12" y2="15"/>
-                            </svg>
-                        </div>
-                        <p class="dropzone-title">Drag & drop your video here</p>
-                        <p class="dropzone-subtitle">Supports MP4, AVI, MOV</p>
-                        <label class="browse-btn" for="fileInput">Browse Files</label>
-                        <input type="file" id="fileInput" accept=".mp4,.avi,.mov" hidden>
-                    </div>
-                    <!-- Progress overlay -->
-                    <div class="upload-progress" id="uploadProgress">
-                        <div class="progress-ring">
-                            <svg viewBox="0 0 100 100">
-                                <circle class="progress-bg" cx="50" cy="50" r="42"/>
-                                <circle class="progress-bar" cx="50" cy="50" r="42" id="progressCircle"/>
-                            </svg>
-                            <span class="progress-text" id="progressText">0%</span>
-                        </div>
-                        <p class="progress-label" id="progressLabel">Uploading...</p>
-                    </div>
+                <div class="model-active" id="modelActiveLine">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                    <span id="activeModelName">Loading...</span>
                 </div>
-                <div class="upload-info" id="uploadInfo" style="display:none;">
-                    <div class="file-info">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-                        <span id="fileName"></span>
+                <div class="model-upload-row">
+                    <label class="model-upload-btn" for="modelFileInput">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        Upload .pt
+                    </label>
+                    <input type="file" id="modelFileInput" accept=".pt" hidden>
+                    <span class="model-upload-hint" id="modelUploadHint">Drop a YOLO .pt weights file</span>
+                </div>
+                <div class="model-progress" id="modelProgress" style="display:none;">
+                    <div class="progress-bar-track">
+                        <div class="progress-bar-fill" id="modelProgressFill"></div>
                     </div>
-                    <span class="file-size" id="fileSize"></span>
+                    <span class="progress-frames" id="modelProgressLabel">Uploading...</span>
+                </div>
+            </div>
+
+            <!-- Physics Processing Card -->
+            <div class="card physics-card">
+                <div class="card-header">
+                    <h2>Run Physics Pipeline</h2>
+                    <div class="chip" id="physicsStatusChip">Idle</div>
+                </div>
+                <div class="physics-form">
+                    <select id="physicsVideoSelect" class="video-select">
+                        <option value="">Select a video...</option>
+                    </select>
+                    <label class="upload-video-btn" for="videoFileInput" title="Upload a new video">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    </label>
+                    <input type="file" id="videoFileInput" accept=".mp4,.avi,.mov" hidden>
+                    <button id="runPhysicsBtn" class="run-btn" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        Run Pipeline
+                    </button>
+                </div>
+                <div class="video-upload-status" id="videoUploadStatus" style="display:none;">
+                    <span id="videoUploadLabel"></span>
+                </div>
+                <div class="pipeline-options">
+                    <label class="option-label">
+                        <input type="checkbox" id="chkPhysics" checked>
+                        <span>Physics <small>(kinematics + DuckDB)</small></span>
+                    </label>
+                    <label class="option-label">
+                        <input type="checkbox" id="chkVlm" checked>
+                        <span>VLM <small>(semantic abstraction)</small></span>
+                    </label>
+                </div>
+                <div class="physics-progress" id="physicsProgress" style="display:none;">
+                    <div class="progress-bar-track">
+                        <div class="progress-bar-fill" id="physicsProgressFill"></div>
+                    </div>
+                    <span class="progress-frames" id="physicsProgressLabel">0 / ? frames</span>
                 </div>
             </div>
 

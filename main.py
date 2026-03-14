@@ -41,6 +41,9 @@ def process_video(
     progress_callback=None,
     alert_callback=None,
     metrics: Optional[MetricsCollector] = None,
+    run_physics: bool = True,
+    run_vlm: bool = True,
+    model_path: str = "yolov8n.pt",
 ):
     """
     Executes the dual-loop Neuro-Symbolic tracking and abstraction pipeline.
@@ -76,16 +79,18 @@ def process_video(
     log.info("Video: %d fps | %d frames | VLM every %d frames (~3/sec)",
              fps, total_frames, semantic_interval)
 
-    # 2. Initialize Hybrid Databases
+    # 2. Initialize Databases (DuckDB always; Milvus/Graph only when VLM enabled)
     duckdb_client = DuckDBClient()
-    milvus_client = SemanticVectorStore()
-    graph_client = GraphClient()
+    if run_vlm:
+        milvus_client = SemanticVectorStore()
+        graph_client = GraphClient()
 
     # 3. Initialize Physics Engine (Micro-Loop) with correct fps
-    detector = load_detector("yolov8n.pt", conf=0.3)
+    detector = load_detector(model_path, conf=0.3)
     tracker = VehicleTracker(tracker_name="bytetrack")
-    transformer = CoordinateTransformer("calibration.yaml")
-    kinematics = KinematicEstimator(fps=float(fps))
+    if run_physics:
+        transformer = CoordinateTransformer("calibration.yaml")
+        kinematics = KinematicEstimator(fps=float(fps))
 
     # --- Multi-frame VLM buffer -------------------------------------------
     # Holds the last SOM_BUFFER_SIZE SoM PIL images.  Passed to the VLM as a
@@ -136,10 +141,11 @@ def process_video(
         log.info("Zone '%s' active — gates: %s",
                  zone_config.zone_id, [g.name for g in zone_config.gates])
 
-    # 4. Initialize Semantic Abstractor (Macro-Loop)
-    renderer = AdaptiveRenderer()
-    vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
-    extractor = EntityExtractor(model_name="qwen2.5:72b")
+    # 4. Initialize Semantic Abstractor (Macro-Loop) — only when VLM enabled
+    if run_vlm:
+        renderer = AdaptiveRenderer()
+        vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
+        extractor = EntityExtractor(model_name="qwen2.5:72b")
 
     frame_id = 0
     start_time = time.time()
@@ -157,50 +163,44 @@ def process_video(
         # ==========================================
         # THE MICRO-LOOP (High-Frequency Physics)
         # ==========================================
-        
-        # 1. Detect & Track
+
+        # 1. Detect & Track (always — tracker feeds both physics and VLM)
         raw_dets = detector.predict(frame)
         tracked_boxes = tracker.update(raw_dets[0], frame)
-        
-        # 2. Map to Real-World 3D Space
-        real_coords = transformer.get_real_world_coords(tracked_boxes)
-        
-        # 3. Extract Kinematic State Vectors
-        # Adjusted to match your KinematicEstimator signature
-        state_vectors = kinematics.update(real_coords) 
-        
-        # 4. Stream to Analytical Database
-        duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors)
 
-        # 5. Real-time alerts (skipped when no alert_callback was provided).
-        # Fix 5: only pass warm tracks to the alert engine — cold tracks (< 15 frames)
-        # have zero acceleration from finite differences and would produce false alerts.
-        if alert_engine is not None:
-            warm_sv = {k: v for k, v in state_vectors.items() if k in kinematics.warm_tracks}
-            alert_engine.check(warm_sv, real_coords, timestamp, frame_id)
+        # 2-7. Physics sub-loop — kinematics, DuckDB, alerts, zones
+        if run_physics:
+            real_coords = transformer.get_real_world_coords(tracked_boxes)
+            state_vectors = kinematics.update(real_coords)
+            duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors)
 
-        # 6. Motion-energy score for VLM gating (cheap, runs every frame)
+            if alert_engine is not None:
+                warm_sv = {k: v for k, v in state_vectors.items() if k in kinematics.warm_tracks}
+                alert_engine.check(warm_sv, real_coords, timestamp, frame_id)
+
+            for tid in state_vectors:
+                if tid not in _vehicle_first_seen:
+                    _vehicle_first_seen[tid] = timestamp
+
+            if zone_manager is not None:
+                crossing_events = zone_manager.update(
+                    tracked_boxes, real_coords, timestamp, frame_id
+                )
+                for event in crossing_events:
+                    duckdb_client.insert_crossing_event(event)
+                    log.info("[%.1fs] Vehicle %d → %s via %s",
+                             timestamp, event.track_id, event.direction, event.gate_name)
+        else:
+            real_coords = {}
+            state_vectors = {}
+
+        # Motion-energy score (cheap, runs every frame — used by VLM gate)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if _prev_gray is not None:
             _motion_score = float(
                 np.mean(np.abs(gray.astype(np.float32) - _prev_gray.astype(np.float32)))
             )
         _prev_gray = gray
-
-        # Track first appearance per vehicle for entity profiles
-        for tid in state_vectors:
-            if tid not in _vehicle_first_seen:
-                _vehicle_first_seen[tid] = timestamp
-
-        # 7. Zone crossing detection (skipped if no zone_config.json)
-        if zone_manager is not None:
-            crossing_events = zone_manager.update(
-                tracked_boxes, real_coords, timestamp, frame_id
-            )
-            for event in crossing_events:
-                duckdb_client.insert_crossing_event(event)
-                log.info("[%.1fs] Vehicle %d → %s via %s",
-                         timestamp, event.track_id, event.direction, event.gate_name)
 
         # ==========================================
         # THE MACRO-LOOP (Low-Frequency Semantics)
@@ -233,7 +233,7 @@ def process_video(
             )
         )
 
-        if _run_macro:
+        if run_vlm and _run_macro:
             _force_was_set = _flags["force_vlm"]
             _flags["force_vlm"] = False
             if metrics is not None and _force_was_set:
@@ -351,8 +351,9 @@ def process_video(
 
     # Safely close database connections
     duckdb_client.close()
-    milvus_client.close()
-    graph_client.close()
+    if run_vlm:
+        milvus_client.close()
+        graph_client.close()
 
     if metrics is not None:
         metrics.end()

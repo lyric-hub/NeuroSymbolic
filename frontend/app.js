@@ -11,18 +11,6 @@ const navItems = document.querySelectorAll(".nav-item");
 const views = document.querySelectorAll(".view");
 const pageTitle = document.getElementById("pageTitle");
 
-// Upload
-const dropzone = document.getElementById("dropzone");
-const fileInput = document.getElementById("fileInput");
-const uploadProgress = document.getElementById("uploadProgress");
-const progressCircle = document.getElementById("progressCircle");
-const progressText = document.getElementById("progressText");
-const progressLabel = document.getElementById("progressLabel");
-const uploadStatusChip = document.getElementById("uploadStatusChip");
-const uploadInfo = document.getElementById("uploadInfo");
-const fileName = document.getElementById("fileName");
-const fileSize = document.getElementById("fileSize");
-
 // Chat
 const chatMessages = document.getElementById("chatMessages");
 const chatForm = document.getElementById("chatForm");
@@ -98,105 +86,49 @@ async function checkHealth() {
 checkHealth();
 setInterval(checkHealth, 15000);
 
-// ===== File Upload =====
-dropzone.addEventListener("click", () => fileInput.click());
+// ===== Inline Video Upload (inside Run Pipeline card) =====
+const videoFileInput    = document.getElementById("videoFileInput");
+const videoUploadStatus = document.getElementById("videoUploadStatus");
+const videoUploadLabel  = document.getElementById("videoUploadLabel");
 
-dropzone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    dropzone.classList.add("dragover");
-});
+videoFileInput.addEventListener("change", () => {
+    const file = videoFileInput.files[0];
+    if (!file) return;
 
-dropzone.addEventListener("dragleave", () => {
-    dropzone.classList.remove("dragover");
-});
+    videoUploadStatus.style.display = "block";
+    videoUploadLabel.textContent = `Uploading ${file.name}...`;
 
-dropzone.addEventListener("drop", (e) => {
-    e.preventDefault();
-    dropzone.classList.remove("dragover");
-    const file = e.dataTransfer.files[0];
-    if (file) handleFileUpload(file);
-});
-
-fileInput.addEventListener("change", () => {
-    const file = fileInput.files[0];
-    if (file) handleFileUpload(file);
-});
-
-async function handleFileUpload(file) {
-    // Validate file type
-    const validTypes = [".mp4", ".avi", ".mov"];
-    const ext = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
-    if (!validTypes.includes(ext)) {
-        showUploadStatus("error", "Unsupported file type");
-        return;
-    }
-
-    // Show file info
-    fileName.textContent = file.name;
-    fileSize.textContent = formatBytes(file.size);
-    uploadInfo.style.display = "flex";
-
-    // Show progress
-    uploadProgress.classList.add("active");
-    showUploadStatus("processing", "Uploading");
-
-    // Simulate upload progress (XHR for real progress)
     const formData = new FormData();
     formData.append("file", file);
 
     const xhr = new XMLHttpRequest();
-
     xhr.upload.addEventListener("progress", (e) => {
         if (e.lengthComputable) {
             const pct = Math.round((e.loaded / e.total) * 100);
-            updateProgress(pct);
+            videoUploadLabel.textContent = `Uploading ${file.name}… ${pct}%`;
         }
     });
-
     xhr.addEventListener("load", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-            updateProgress(100);
-            progressLabel.textContent = "Processing in background...";
-            showUploadStatus("processing", "Processing");
-
-            setTimeout(() => {
-                uploadProgress.classList.remove("active");
-                showUploadStatus("done", "Complete");
-            }, 2000);
+            videoUploadLabel.textContent = `${file.name} saved`;
+            loadVideoList().then(() => {
+                // Auto-select the just-uploaded file
+                physicsVideoSelect.value = file.name;
+                runPhysicsBtn.disabled = false;
+            });
+            setTimeout(() => { videoUploadStatus.style.display = "none"; }, 3000);
         } else {
-            uploadProgress.classList.remove("active");
-            showUploadStatus("error", "Upload failed");
+            videoUploadLabel.textContent = "Upload failed";
         }
+        videoFileInput.value = "";
     });
-
     xhr.addEventListener("error", () => {
-        uploadProgress.classList.remove("active");
-        showUploadStatus("error", "Server error");
+        videoUploadLabel.textContent = "Server error";
+        videoFileInput.value = "";
     });
-
     xhr.open("POST", `${API_BASE}/upload_video/`);
     xhr.send(formData);
-}
-
-function updateProgress(pct) {
-    const circumference = 2 * Math.PI * 42; // r=42 from SVG
-    const offset = circumference - (pct / 100) * circumference;
-    progressCircle.style.strokeDashoffset = offset;
-    progressText.textContent = `${pct}%`;
-}
-
-function showUploadStatus(type, text) {
-    uploadStatusChip.className = `chip ${type}`;
-    uploadStatusChip.textContent = text;
-}
-
-function formatBytes(bytes) {
-    if (bytes === 0) return "0 B";
-    const k = 1024;
-    const sizes = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
+});
 
 // ===== Chat =====
 let isWaiting = false;
@@ -284,6 +216,193 @@ function showTyping() {
     chatMessages.scrollTop = chatMessages.scrollHeight;
     return el;
 }
+
+// ===== Model Management =====
+const modelFileInput     = document.getElementById("modelFileInput");
+const activeModelName    = document.getElementById("activeModelName");
+const modelStatusChip    = document.getElementById("modelStatusChip");
+const modelProgress      = document.getElementById("modelProgress");
+const modelProgressFill  = document.getElementById("modelProgressFill");
+const modelProgressLabel = document.getElementById("modelProgressLabel");
+const modelUploadHint    = document.getElementById("modelUploadHint");
+
+async function loadActiveModel() {
+    try {
+        const res = await fetch(`${API_BASE}/models/`);
+        if (!res.ok) return;
+        const data = await res.json();
+        activeModelName.textContent = data.active;
+        modelStatusChip.className = "chip done";
+        modelStatusChip.textContent = "Active";
+    } catch {
+        activeModelName.textContent = "yolov8n.pt (default)";
+    }
+}
+
+modelFileInput.addEventListener("change", async () => {
+    const file = modelFileInput.files[0];
+    if (!file) return;
+    if (!file.name.endsWith(".pt")) {
+        modelUploadHint.textContent = "Only .pt files are accepted.";
+        return;
+    }
+
+    modelStatusChip.className = "chip processing";
+    modelStatusChip.textContent = "Uploading";
+    modelUploadHint.textContent = file.name;
+    modelProgress.style.display = "block";
+    modelProgressFill.style.width = "0%";
+    modelProgressLabel.textContent = "Uploading...";
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.upload.addEventListener("progress", (e) => {
+        if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            modelProgressFill.style.width = `${pct}%`;
+            modelProgressLabel.textContent = `${pct}%`;
+        }
+    });
+    xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+            modelProgressFill.style.width = "100%";
+            modelProgressLabel.textContent = "Upload complete";
+            modelStatusChip.className = "chip done";
+            modelStatusChip.textContent = "Active";
+            activeModelName.textContent = file.name;
+            setTimeout(() => { modelProgress.style.display = "none"; }, 2000);
+        } else {
+            modelProgressLabel.textContent = "Upload failed";
+            modelStatusChip.className = "chip error";
+            modelStatusChip.textContent = "Failed";
+        }
+        modelFileInput.value = "";
+    });
+    xhr.addEventListener("error", () => {
+        modelProgressLabel.textContent = "Server error";
+        modelStatusChip.className = "chip error";
+        modelStatusChip.textContent = "Failed";
+        modelFileInput.value = "";
+    });
+
+    xhr.open("POST", `${API_BASE}/upload_model/`);
+    xhr.send(formData);
+});
+
+loadActiveModel();
+
+// ===== Physics Processing =====
+const physicsVideoSelect  = document.getElementById("physicsVideoSelect");
+const runPhysicsBtn       = document.getElementById("runPhysicsBtn");
+const physicsStatusChip   = document.getElementById("physicsStatusChip");
+const physicsProgress     = document.getElementById("physicsProgress");
+const physicsProgressFill = document.getElementById("physicsProgressFill");
+const physicsProgressLabel = document.getElementById("physicsProgressLabel");
+
+let physicsJobId     = null;
+let physicsPoller    = null;
+
+async function loadVideoList() {
+    try {
+        const res = await fetch(`${API_BASE}/calibrate/videos`);
+        if (!res.ok) return;
+        const data = await res.json();
+        physicsVideoSelect.innerHTML = data.videos.length
+            ? `<option value="">Select a video...</option>` +
+              data.videos.map(v => `<option value="${v}">${v}</option>`).join("")
+            : `<option value="">No videos found</option>`;
+        runPhysicsBtn.disabled = data.videos.length === 0;
+    } catch {
+        physicsVideoSelect.innerHTML = `<option value="">Could not load videos</option>`;
+    }
+}
+
+physicsVideoSelect.addEventListener("change", () => {
+    runPhysicsBtn.disabled = !physicsVideoSelect.value;
+});
+
+runPhysicsBtn.addEventListener("click", async () => {
+    const videoPath = physicsVideoSelect.value;
+    if (!videoPath) return;
+
+    const runPhysics = document.getElementById("chkPhysics").checked;
+    const runVlm    = document.getElementById("chkVlm").checked;
+    if (!runPhysics && !runVlm) {
+        alert("Select at least one of Physics or VLM.");
+        return;
+    }
+
+    runPhysicsBtn.disabled = true;
+    physicsVideoSelect.disabled = true;
+    setPhysicsChip("processing", "Running");
+    physicsProgress.style.display = "block";
+    physicsProgressFill.style.width = "0%";
+    physicsProgressLabel.textContent = "Starting...";
+
+    try {
+        const res = await fetch(`${API_BASE}/run_physics/`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ video_path: videoPath, run_physics: runPhysics, run_vlm: runVlm }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => null);
+            setPhysicsChip("error", "Failed");
+            physicsProgressLabel.textContent = err?.detail || "Error starting job";
+            physicsVideoSelect.disabled = false;
+            runPhysicsBtn.disabled = false;
+            return;
+        }
+        const job = await res.json();
+        physicsJobId = job.job_id;
+        physicsPoller = setInterval(pollPhysicsJob, 2000);
+    } catch {
+        setPhysicsChip("error", "Server error");
+        physicsVideoSelect.disabled = false;
+        runPhysicsBtn.disabled = false;
+    }
+});
+
+async function pollPhysicsJob() {
+    if (!physicsJobId) return;
+    try {
+        const res = await fetch(`${API_BASE}/job/${physicsJobId}`);
+        if (!res.ok) return;
+        const job = await res.json();
+
+        if (job.frames_processed != null && job.total_frames) {
+            const pct = Math.round((job.frames_processed / job.total_frames) * 100);
+            physicsProgressFill.style.width = `${pct}%`;
+            physicsProgressLabel.textContent = `${job.frames_processed} / ${job.total_frames} frames (${pct}%)`;
+        }
+
+        if (job.status === "done") {
+            clearInterval(physicsPoller);
+            physicsPoller = null;
+            physicsProgressFill.style.width = "100%";
+            physicsProgressLabel.textContent = "Complete — databases populated";
+            setPhysicsChip("done", "Done");
+            physicsVideoSelect.disabled = false;
+            runPhysicsBtn.disabled = false;
+        } else if (job.status === "failed") {
+            clearInterval(physicsPoller);
+            physicsPoller = null;
+            setPhysicsChip("error", "Failed");
+            physicsProgressLabel.textContent = job.error || "Pipeline error";
+            physicsVideoSelect.disabled = false;
+            runPhysicsBtn.disabled = false;
+        }
+    } catch { /* network hiccup — keep polling */ }
+}
+
+function setPhysicsChip(type, text) {
+    physicsStatusChip.className = `chip ${type}`;
+    physicsStatusChip.textContent = text;
+}
+
+loadVideoList();
 
 // ===== Quick Chat (Dashboard) =====
 quickChatForm.addEventListener("submit", async (e) => {
