@@ -43,9 +43,11 @@ const apiBadge = document.getElementById("apiBadge");
 // ===== Navigation =====
 navItems.forEach((item) => {
     item.addEventListener("click", (e) => {
+        // Only intercept items that switch an in-page view (have data-view).
+        // Items with a real href (like /calibrate-ui) navigate normally.
+        if (!item.dataset.view) return;
         e.preventDefault();
-        const viewId = item.dataset.view;
-        switchView(viewId);
+        switchView(item.dataset.view);
     });
 });
 
