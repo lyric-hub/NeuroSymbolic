@@ -57,6 +57,7 @@ from .tools import (
     verify_physics_math,
     query_zone_flow,
     evaluate_traffic_rules,
+    search_vehicles_by_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -65,11 +66,12 @@ from .tools import (
 # ---------------------------------------------------------------------------
 TOOLS_FULL = [
     search_semantic_events,
-    search_entity_profiles,   # Vehicle-level longitudinal behavioral profiles
+    search_entity_profiles,
     query_graph_relationships,
     verify_physics_math,
-    evaluate_traffic_rules,   # Symbolic Rule Engine
+    evaluate_traffic_rules,
     query_zone_flow,
+    search_vehicles_by_type,  # Class-based vehicle lookup (motorcycle, car, bus…)
 ]
 TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
@@ -110,6 +112,12 @@ Available tools:
 6. query_zone_flow             — Zone entry/exit counts and OD (Origin-Destination) pairs.
                                  Use for flow, counts, gate entry/exit, dwell time, OD matrix.
 
+7. search_vehicles_by_type     — Find all track_ids of a given vehicle class.
+                                 Use FIRST when the query mentions a vehicle type:
+                                 "motorcycle", "car", "bus", "truck", "bicycle", "person".
+                                 For "two-wheelers": call twice — "motorcycle" + "bicycle".
+                                 Returns track_ids to use with tools 4 and 5.
+
 Decision rules:
 - Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
 - Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5.
@@ -117,6 +125,7 @@ Decision rules:
 - Combined safety + relationships: tools 1 → 3 → 5.
 - Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
 - Flow/count/OD questions: tool 6 directly.
+- Vehicle-type questions ("behaviour of motorcycles"): tool 7 → tools 4 + 5 per track_id.
 - Always cite the tool output that supports each claim in your final answer.
 - Base your final answer strictly on what the tools returned. Do not invent facts."""
 
@@ -140,7 +149,8 @@ _PLANNER_PROMPT = (
     "Decompose the following query into a concrete, ordered investigation plan (3-5 steps max).\n\n"
     "For each step specify which tool to use and what specific data to look for.\n\n"
     "Available tools: search_semantic_events, search_entity_profiles, "
-    "query_graph_relationships, verify_physics_math, evaluate_traffic_rules, query_zone_flow\n\n"
+    "query_graph_relationships, verify_physics_math, evaluate_traffic_rules, "
+    "query_zone_flow, search_vehicles_by_type\n\n"
     "Query: {query}\n\n"
     "Output a numbered list only. Be specific and concise."
 )

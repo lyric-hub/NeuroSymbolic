@@ -2,6 +2,8 @@ import cv2
 import logging
 import time
 import json
+import threading
+import queue as queue_module
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -15,31 +17,180 @@ from src.physics_engine.homography import CoordinateTransformer
 from src.physics_engine.kinematics import KinematicEstimator
 from src.physics_engine.zone_manager import ZoneManager, ZoneConfig
 
-# --- Phase 2: Semantic Abstraction Imports ---
-from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext
-from src.semantic_abstractor.vlm_inference import TrafficSemanticAbstractor
-from src.semantic_abstractor.entity_extractor import EntityExtractor
-
 # --- Phase 3: Hybrid Database Imports ---
 from src.memory_layer.duckdb_client import DuckDBClient
-from src.memory_layer.milvus_client import SemanticVectorStore
-from src.memory_layer.graph_client import GraphClient
 
 # --- Phase 4: Agentic Orchestrator ---
 from src.agentic_orchestrator.sequential_pipeline import agent_app, AGENT_INVOKE_CONFIG
-
-# --- Phase 5: Alert Engine (optional) ---
-from src.symbolic_engine.alert_engine import AlertEngine, TrafficAlert
 
 # --- Phase 6: Evaluation Metrics ---
 from src.evaluation.metrics import MetricsCollector, time_operation
 
 log = logging.getLogger(__name__)
 
+SOM_BUFFER_SIZE = 6
+
+# YOLO COCO class IDs → human-readable vehicle labels.
+# Only vehicle classes relevant to traffic analysis are listed.
+YOLO_CLASS_NAMES: dict = {
+    0: "person",
+    1: "bicycle",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+}
+
+
+def _vlm_worker(
+    task_queue: queue_module.Queue,
+    stop_event: threading.Event,
+    metrics: Optional["MetricsCollector"],
+) -> None:
+    """
+    Background thread: drains semantic tasks enqueued by the physics loop.
+
+    Each task is an 8-tuple:
+        (frame, tracked_boxes, state_vectors, warm_tracks,
+         timestamp, frame_id, vehicle_first_seen, behavior_summary)
+    A sentinel value of None signals the worker to shut down cleanly.
+    """
+    from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext
+    from src.semantic_abstractor.vlm_inference import TrafficSemanticAbstractor
+    from src.semantic_abstractor.entity_extractor import EntityExtractor
+    from src.memory_layer.milvus_client import SemanticVectorStore
+    from src.memory_layer.graph_client import GraphClient
+    from src.evaluation.metrics import time_operation
+
+    renderer = AdaptiveRenderer()
+    vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
+    extractor = EntityExtractor(model_name="qwen2.5:72b")
+    milvus_client = SemanticVectorStore()
+    graph_client = GraphClient()
+
+    _som_buffer: deque = deque(maxlen=SOM_BUFFER_SIZE)
+    # parallel: (timestamp, frozenset of IDs) per buffered frame
+    _id_buffer:  deque = deque(maxlen=SOM_BUFFER_SIZE)
+    _prev_window_ptr = None
+
+    while True:
+        try:
+            task = task_queue.get(timeout=1.0)
+        except queue_module.Empty:
+            if stop_event.is_set():
+                break
+            continue
+
+        if task is None:  # sentinel — shut down cleanly
+            task_queue.task_done()
+            break
+
+        (frame, tracked_boxes, state_vectors, warm_tracks,
+         timestamp, frame_id,
+         vehicle_first_seen, behavior_summary) = task
+
+        HISTORY_WINDOW_SECS = 5.0
+        chunk_start = max(0.0, timestamp - HISTORY_WINDOW_SECS)
+        time_window_ptr = f"{chunk_start:.1f}-{timestamp:.1f}"
+
+        # 1. Set-of-Mark visual grounding
+        som_frame = frame.copy()
+        render_ctx = RenderContext()
+        render_ctx.update(tracked_boxes, timestamp)
+        renderer.render(som_frame, render_ctx)
+        som_pil = Image.fromarray(cv2.cvtColor(som_frame, cv2.COLOR_BGR2RGB))
+
+        # Append frame + its (timestamp, IDs) to parallel buffers
+        _som_buffer.append(som_pil)
+        _id_buffer.append((timestamp, frozenset(int(t[4]) for t in tracked_boxes)))
+
+        # Build per-frame ID timeline from the buffer for the VLM prompt.
+        # Gives the model precise temporal presence — it can tell which
+        # vehicles co-existed and which never shared a frame.
+        frame_id_timeline = [(ts, sorted(ids)) for ts, ids in _id_buffer]
+        all_active_ids = sorted(set().union(*(ids for _, ids in _id_buffer)))
+
+        # 2. VLM inference
+        with time_operation() as _vlm_timer:
+            vlm_triples = vlm.generate_scene_graph_triples(
+                list(_som_buffer),
+                timestamp,
+                state_vectors,
+                warm_tracks,
+                behavior_summary=behavior_summary,
+                fps=3.0,
+                tracked_boxes=tracked_boxes,
+                all_active_ids=all_active_ids,
+                frame_id_timeline=frame_id_timeline,
+            )
+        if metrics is not None:
+            metrics.record_vlm_call(
+                latency_ms=_vlm_timer.elapsed_ms,
+                parse_success=bool(vlm_triples),
+                triple_count=len(vlm_triples) if vlm_triples else 0,
+            )
+
+        if vlm_triples:
+            nl_description = " ".join(
+                f"{t['subject']} {t['predicate']} {t['object']}."
+                for t in vlm_triples
+            )
+            with time_operation() as _milvus_timer:
+                milvus_client.insert_event_chunk(
+                    nl_description, chunk_start, timestamp, frame_id
+                )
+            if metrics is not None:
+                metrics.record_milvus_insert(_milvus_timer.elapsed_ms)
+
+            scene_description = json.dumps(vlm_triples)
+            active_ids = [int(t[4]) for t in tracked_boxes]
+            validated_triples = extractor.extract_triples(
+                scene_description, timestamp, set(active_ids)
+            )
+
+            if validated_triples:
+                with time_operation() as _graph_timer:
+                    graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
+                if metrics is not None:
+                    metrics.record_graph_insert(_graph_timer.elapsed_ms)
+
+                if _prev_window_ptr is not None:
+                    gap_s = (float(time_window_ptr.split("-")[0])
+                             - float(_prev_window_ptr.split("-")[0]))
+                    graph_client.insert_temporal_edges(
+                        active_ids, _prev_window_ptr, time_window_ptr, gap_s
+                    )
+
+                _prev_window_ptr = time_window_ptr
+
+        # 3. Entity profile upsert
+        if behavior_summary:
+            for line in behavior_summary.strip().splitlines():
+                line = line.strip()
+                if not line.startswith("Vehicle"):
+                    continue
+                try:
+                    parts = line.split(":", 1)
+                    vid = int(parts[0].replace("Vehicle", "").strip())
+                    milvus_client.upsert_entity_profile(
+                        track_id=vid,
+                        summary=line,
+                        first_seen=vehicle_first_seen.get(vid, timestamp),
+                        last_seen=timestamp,
+                    )
+                except (ValueError, IndexError):
+                    pass
+
+        task_queue.task_done()
+
+    milvus_client.close()
+    graph_client.close()
+    log.info("VLM worker shut down.")
+
+
 def process_video(
     video_path: str,
     progress_callback=None,
-    alert_callback=None,
     metrics: Optional[MetricsCollector] = None,
     run_physics: bool = True,
     run_vlm: bool = True,
@@ -54,15 +205,10 @@ def process_video(
         video_path:         Path to the input video file.
         progress_callback:  Optional callable(frames_done: int, total_frames: int)
                             invoked once per frame so callers can track progress.
-        alert_callback:     Optional callable(alert: TrafficAlert) invoked in
-                            real-time whenever a kinematic threshold is crossed.
-                            When None, the alert engine is disabled entirely.
         metrics:            Optional MetricsCollector that records proxy evaluation
                             metrics (VLM quality, DB latency, alert distribution).
                             Call metrics.log_summary() after this function returns.
     """
-    # Reset per-call state stored on the function object
-    process_video._prev_window_ptr = None
     log.info("Initializing Neuro-Symbolic Pipeline...")
 
     # 1. Open Video Stream FIRST to read actual fps and frame count.
@@ -79,11 +225,8 @@ def process_video(
     log.info("Video: %d fps | %d frames | VLM every %d frames (~3/sec)",
              fps, total_frames, semantic_interval)
 
-    # 2. Initialize Databases (DuckDB always; Milvus/Graph only when VLM enabled)
+    # 2. Initialize Databases (DuckDB always; Milvus/Graph handled in VLM worker thread)
     duckdb_client = DuckDBClient()
-    if run_vlm:
-        milvus_client = SemanticVectorStore()
-        graph_client = GraphClient()
 
     # 3. Initialize Physics Engine (Micro-Loop) with correct fps
     detector = load_detector(model_path, conf=0.3)
@@ -91,13 +234,6 @@ def process_video(
     if run_physics:
         transformer = CoordinateTransformer("calibration.yaml")
         kinematics = KinematicEstimator(fps=float(fps))
-
-    # --- Multi-frame VLM buffer -------------------------------------------
-    # Holds the last SOM_BUFFER_SIZE SoM PIL images.  Passed to the VLM as a
-    # native video clip giving genuine temporal context (MRoPE encoding).
-    # Covers ~2 s of traffic at 3 VLM samples/sec.
-    SOM_BUFFER_SIZE = 6
-    _som_buffer: deque = deque(maxlen=SOM_BUFFER_SIZE)
 
     # --- Motion-energy gating --------------------------------------------
     # Skip the VLM call on frames where the scene is effectively static
@@ -107,26 +243,6 @@ def process_video(
     MOTION_SKIP_THRESHOLD = 2.0    # mean absolute pixel difference (0–255)
     _prev_gray: np.ndarray | None = None
     _motion_score: float = 999.0
-
-    # --- Alert-triggered forced VLM call ---------------------------------
-    # When the AlertEngine fires a COLLISION_SUSPECTED or HARD_BRAKING alert
-    # the exact critical frame is always sent to the VLM — regardless of
-    # the fixed-interval schedule or motion-energy gate.
-    _flags: dict = {"force_vlm": False}
-
-    def _alert_handler(alert) -> None:
-        if alert.alert_type in ("COLLISION_SUSPECTED", "HARD_BRAKING"):
-            _flags["force_vlm"] = True
-        # Fix 4: persist every alert to DuckDB immediately (direct INSERT, no buffer).
-        duckdb_client.insert_alert(alert)
-        if alert_callback:
-            alert_callback(alert)
-        if metrics is not None:
-            metrics.record_alert_fired(alert.alert_type)
-
-    alert_engine = AlertEngine(on_alert=_alert_handler) if alert_callback else None
-    if alert_engine:
-        log.info("Alert engine active — real-time kinematic alerts + forced VLM on critical events.")
 
     # --- Entity profile tracking -----------------------------------------
     # Accumulates first_seen timestamp per vehicle for entity_profiles.
@@ -141,11 +257,20 @@ def process_video(
         log.info("Zone '%s' active — gates: %s",
                  zone_config.zone_id, [g.name for g in zone_config.gates])
 
-    # 4. Initialize Semantic Abstractor (Macro-Loop) — only when VLM enabled
+    # 4. Start VLM worker thread (Macro-Loop runs in background)
     if run_vlm:
-        renderer = AdaptiveRenderer()
-        vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
-        extractor = EntityExtractor(model_name="qwen2.5:72b")
+        # Bounded queue: if VLM is slower than physics, drop frames rather
+        # than accumulating unbounded memory.
+        _vlm_queue: queue_module.Queue = queue_module.Queue(maxsize=4)
+        _vlm_stop = threading.Event()
+        _vlm_thread = threading.Thread(
+            target=_vlm_worker,
+            args=(_vlm_queue, _vlm_stop, metrics),
+            name="vlm-worker",
+            daemon=True,
+        )
+        _vlm_thread.start()
+        log.info("VLM worker thread started — macro-loop running in background.")
 
     frame_id = 0
     start_time = time.time()
@@ -172,11 +297,11 @@ def process_video(
         if run_physics:
             real_coords = transformer.get_real_world_coords(tracked_boxes)
             state_vectors = kinematics.update(real_coords)
-            duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors)
-
-            if alert_engine is not None:
-                warm_sv = {k: v for k, v in state_vectors.items() if k in kinematics.warm_tracks}
-                alert_engine.check(warm_sv, real_coords, timestamp, frame_id)
+            class_labels = {
+                int(t[4]): YOLO_CLASS_NAMES.get(int(t[6]), "unknown")
+                for t in tracked_boxes
+            }
+            duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors, class_labels)
 
             for tid in state_vectors:
                 if tid not in _vehicle_first_seen:
@@ -214,129 +339,43 @@ def process_video(
         )
         if (metrics is not None
                 and _is_interval_frame
-                and _motion_score < MOTION_SKIP_THRESHOLD
-                and not _flags["force_vlm"]):
+                and _motion_score < MOTION_SKIP_THRESHOLD):
             metrics.record_motion_skip()
 
         # MACRO-LOOP condition:
         #   - Fixed interval: every semantic_interval frames (~3/sec)
-        #   - OR forced: when AlertEngine flagged a critical event this frame
-        # Motion-energy gate: skip static scenes (saves ~40-60% VLM calls)
-        # unless a critical alert forced this tick.
+        #   - Motion-energy gate: skip static scenes (saves ~40-60% VLM calls)
         _run_macro = (
             frame_id > 0
             and len(tracked_boxes) > 0
-            and (
-                (frame_id % semantic_interval == 0
-                 and (_motion_score >= MOTION_SKIP_THRESHOLD or _flags["force_vlm"]))
-                or _flags["force_vlm"]
-            )
+            and frame_id % semantic_interval == 0
+            and _motion_score >= MOTION_SKIP_THRESHOLD
         )
 
         if run_vlm and _run_macro:
-            _force_was_set = _flags["force_vlm"]
-            _flags["force_vlm"] = False
-            if metrics is not None and _force_was_set:
-                metrics.record_force_vlm()
-            log.debug("[%.1fs] Running Semantic Abstraction (motion=%.1f, frames=%d)...",
-                      timestamp, _motion_score, len(_som_buffer) + 1)
-
-            HISTORY_WINDOW_SECS = 5.0
-            chunk_start = max(0.0, timestamp - HISTORY_WINDOW_SECS)
-            time_window_ptr = f"{chunk_start:.1f}-{timestamp:.1f}"
-
-            # 1. Visual Grounding (Set-of-Mark) — render current frame
-            som_frame = frame.copy()
-            render_ctx = RenderContext()
-            render_ctx.update(tracked_boxes, timestamp)
-            renderer.render(som_frame, render_ctx)
-            som_pil = Image.fromarray(cv2.cvtColor(som_frame, cv2.COLOR_BGR2RGB))
-
-            # Append to rolling buffer (deque handles maxlen eviction)
-            _som_buffer.append(som_pil)
-
-            # 2. Behaviour history from DuckDB (change-only, last 5s)
+            # Pre-compute behavior_summary on the main thread (fast DuckDB read)
+            # so the worker has it immediately without touching DuckDB itself.
             active_ids = [int(t[4]) for t in tracked_boxes]
             behavior_summary = duckdb_client.get_behavior_summary(active_ids, timestamp)
 
-            # 3. VLM Inference — pass frame buffer for temporal context.
-            # Multi-frame path: Qwen2.5-VL receives the buffer as a native
-            # video clip (frame-list format + fps).  The model uses MRoPE
-            # temporal position encoding to understand motion across frames.
-            # Single-frame fallback if buffer only has 1 entry (early in video).
-            with time_operation() as _vlm_timer:
-                vlm_triples = vlm.generate_scene_graph_triples(
-                    list(_som_buffer),
-                    timestamp,
-                    state_vectors,
-                    kinematics.warm_tracks,
-                    behavior_summary=behavior_summary,
-                    fps=3.0,  # VLM sample rate: semantic_interval ≈ fps/3
-                )
-            if metrics is not None:
-                metrics.record_vlm_call(
-                    latency_ms=_vlm_timer.elapsed_ms,
-                    parse_success=bool(vlm_triples),
-                    triple_count=len(vlm_triples) if vlm_triples else 0,
-                )
-
-            if vlm_triples:
-                # NL for Milvus (better embeddings than JSON syntax)
-                nl_description = " ".join(
-                    f"{t['subject']} {t['predicate']} {t['object']}."
-                    for t in vlm_triples
-                )
-                with time_operation() as _milvus_timer:
-                    milvus_client.insert_event_chunk(
-                        nl_description, chunk_start, timestamp, frame_id
-                    )
-                if metrics is not None:
-                    metrics.record_milvus_insert(_milvus_timer.elapsed_ms)
-
-                # JSON for EntityExtractor (qwen2.5:72b needs SPO keys)
-                scene_description = json.dumps(vlm_triples)
-                # Fix 3: pass active track IDs so hallucinated vehicle IDs are filtered.
-                validated_triples = extractor.extract_triples(scene_description, timestamp, set(active_ids))
-
-                if validated_triples:
-                    # Previous window for PRECEDES edge (None on first tick)
-                    prev_window_ptr = getattr(process_video, "_prev_window_ptr", None)
-
-                    with time_operation() as _graph_timer:
-                        graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
-                    if metrics is not None:
-                        metrics.record_graph_insert(_graph_timer.elapsed_ms)
-
-                    # Insert PRECEDES temporal edges linking this window to the last
-                    if prev_window_ptr is not None:
-                        gap_s = float(time_window_ptr.split("-")[0]) - float(prev_window_ptr.split("-")[0])
-                        graph_client.insert_temporal_edges(
-                            active_ids, prev_window_ptr, time_window_ptr, gap_s
-                        )
-
-                    process_video._prev_window_ptr = time_window_ptr
-
-            # 4. Entity profile update (longitudinal per-vehicle memory)
-            # Parse behavior_summary lines to get per-vehicle narratives
-            # and upsert into Milvus entity_profiles collection.
-            if behavior_summary:
-                for line in behavior_summary.strip().splitlines():
-                    line = line.strip()
-                    if not line.startswith("Vehicle"):
-                        continue
-                    try:
-                        # Extract vehicle ID from "Vehicle N: ..."
-                        parts = line.split(":", 1)
-                        vid = int(parts[0].replace("Vehicle", "").strip())
-                        narrative = line  # full line as the profile text
-                        milvus_client.upsert_entity_profile(
-                            track_id=vid,
-                            summary=narrative,
-                            first_seen=_vehicle_first_seen.get(vid, timestamp),
-                            last_seen=timestamp,
-                        )
-                    except (ValueError, IndexError):
-                        pass
+            task = (
+                frame.copy(),
+                list(tracked_boxes),
+                dict(state_vectors),
+                frozenset(kinematics.warm_tracks) if run_physics else frozenset(),
+                timestamp,
+                frame_id,
+                dict(_vehicle_first_seen),
+                behavior_summary,
+            )
+            try:
+                _vlm_queue.put_nowait(task)
+                log.debug("[%.1fs] Enqueued semantic task (queue depth=%d)",
+                          timestamp, _vlm_queue.qsize())
+            except queue_module.Full:
+                # VLM worker is still busy — drop this frame rather than block.
+                log.debug("[%.1fs] VLM queue full — dropping frame %d",
+                          timestamp, frame_id)
 
         if progress_callback is not None:
             progress_callback(frame_id, total_frames)
@@ -349,11 +388,14 @@ def process_video(
     cap.release()
     log.info("--- Video Processing Complete in %.2fs ---", time.time() - start_time)
 
+    # Wait for VLM worker to drain and shut down gracefully
+    if run_vlm:
+        log.info("Waiting for VLM worker to finish remaining tasks...")
+        _vlm_queue.put(None)  # sentinel
+        _vlm_thread.join()
+
     # Safely close database connections
     duckdb_client.close()
-    if run_vlm:
-        milvus_client.close()
-        graph_client.close()
 
     if metrics is not None:
         metrics.end()

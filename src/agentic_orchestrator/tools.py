@@ -251,7 +251,43 @@ def query_zone_flow(
 
 
 # ---------------------------------------------------------------------------
-# Tool 5 — Symbolic Rule Engine (deterministic)
+# Tool 5 — Vehicle class lookup (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def search_vehicles_by_type(vehicle_type: str) -> str:
+    """
+    Look up all track_ids matching a specific vehicle class detected by YOLO.
+
+    Use this tool FIRST when the user asks about a category of vehicles, such as:
+      - "two-wheelers" / "motorcycles" / "bikes"  → pass "motorcycle"
+      - "bicycles"                                 → pass "bicycle"
+      - "cars"                                     → pass "car"
+      - "buses"                                    → pass "bus"
+      - "trucks"                                   → pass "truck"
+      - "pedestrians" / "people"                   → pass "person"
+
+    For two-wheelers, call this tool TWICE: once with "motorcycle" and once
+    with "bicycle" to capture both sub-types.
+
+    Returns track_id, class_label, first_seen, last_seen, frame_count for every
+    matching vehicle. Use the returned track_ids with verify_physics_math and
+    evaluate_traffic_rules to analyse their behaviour.
+    """
+    log.info("Tool: search_vehicles_by_type | type='%s'", vehicle_type)
+    results = _get_duckdb().get_vehicles_by_class(vehicle_type)
+
+    if not results:
+        return (
+            f"No vehicles of type '{vehicle_type}' found. "
+            "Either none were detected or the video has not been processed yet."
+        )
+
+    return json.dumps(results, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 6 — Symbolic Rule Engine (deterministic)
 # ---------------------------------------------------------------------------
 
 @tool

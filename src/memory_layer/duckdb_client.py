@@ -28,17 +28,25 @@ class DuckDBClient:
         """Creates tables and indexes for both physics and zone-crossing data."""
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_trajectories (
-                timestamp DOUBLE,
-                frame_id  UINTEGER,
-                track_id  UINTEGER,
-                pos_x     DOUBLE,
-                pos_y     DOUBLE,
-                vel_x     DOUBLE,
-                vel_y     DOUBLE,
-                accel_x   DOUBLE,
-                accel_y   DOUBLE
+                timestamp   DOUBLE,
+                frame_id    UINTEGER,
+                track_id    UINTEGER,
+                pos_x       DOUBLE,
+                pos_y       DOUBLE,
+                vel_x       DOUBLE,
+                vel_y       DOUBLE,
+                accel_x     DOUBLE,
+                accel_y     DOUBLE,
+                class_label VARCHAR
             )
         """)
+        # Migration: add class_label to existing databases that pre-date this column.
+        try:
+            self.conn.execute(
+                "ALTER TABLE vehicle_trajectories ADD COLUMN class_label VARCHAR DEFAULT 'unknown'"
+            )
+        except Exception:
+            pass  # column already exists
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_time_track
             ON vehicle_trajectories(track_id, timestamp)
@@ -80,24 +88,34 @@ class DuckDBClient:
             )
         """)
 
-    def insert_state_vectors(self, timestamp: float, frame_id: int, state_vectors: Dict[int, List[float]]):
+    def insert_state_vectors(
+        self,
+        timestamp: float,
+        frame_id: int,
+        state_vectors: Dict[int, List[float]],
+        class_labels: Dict[int, str] = None,
+    ):
         """
         Rapidly ingests the dictionary output from kinematics.py.
         Uses a persistent DuckDB Appender that stays open across frames,
         flushing to disk every FLUSH_EVERY_N_FRAMES frames.
 
         Args:
-            timestamp: The current video timestamp (seconds).
-            frame_id: The current video frame number.
+            timestamp:     The current video timestamp (seconds).
+            frame_id:      The current video frame number.
             state_vectors: Format {track_id: [x, y, v_x, v_y, a_x, a_y]}
+            class_labels:  Optional {track_id: class_name} from YOLO detections
+                           (e.g. "car", "motorcycle", "bus", "truck").
         """
         if not state_vectors:
             return
 
+        _labels = class_labels or {}
         for track_id, sv in state_vectors.items():
             self._buffer.append((
                 timestamp, frame_id, track_id,
-                sv[0], sv[1], sv[2], sv[3], sv[4], sv[5]
+                sv[0], sv[1], sv[2], sv[3], sv[4], sv[5],
+                _labels.get(track_id, "unknown"),
             ))
 
         self._frames_since_flush += 1
@@ -109,7 +127,7 @@ class DuckDBClient:
         if not self._buffer:
             return
         self.conn.executemany(
-            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?,?)",
             self._buffer,
         )
         self._buffer.clear()
@@ -131,6 +149,39 @@ class DuckDBClient:
         """
         # Returns a pandas dataframe for easy analytical processing by the agent
         return self.conn.execute(query, (track_id, start_time, end_time)).df()
+
+    def get_vehicles_by_class(self, class_label: str) -> List[dict]:
+        """
+        Returns all distinct track_ids whose YOLO class label matches the query.
+        Uses a LIKE match so partial strings work (e.g. "motor" matches "motorcycle").
+
+        Args:
+            class_label: Vehicle type string — "motorcycle", "car", "bus", "truck",
+                         "bicycle", "person", or any partial substring.
+
+        Returns:
+            List of dicts with track_id, class_label, first_seen, last_seen, frame_count.
+        """
+        self._flush()
+        result = self.conn.execute(
+            """
+            SELECT
+                track_id,
+                class_label,
+                MIN(timestamp) AS first_seen,
+                MAX(timestamp) AS last_seen,
+                COUNT(*)       AS frame_count
+            FROM vehicle_trajectories
+            WHERE LOWER(class_label) LIKE LOWER(?)
+            GROUP BY track_id, class_label
+            ORDER BY track_id
+            """,
+            (f"%{class_label}%",),
+        ).df()
+
+        if result.empty:
+            return []
+        return result.to_dict(orient="records")
 
     def get_behavior_summary(
         self,

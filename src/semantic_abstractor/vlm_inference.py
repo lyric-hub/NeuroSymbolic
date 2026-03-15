@@ -30,12 +30,15 @@ References:
 """
 
 import json
+import logging
 import re
 import torch
 from PIL import Image
-from typing import List, Dict, Any, Set
+from typing import Any, Dict, List, Optional, Set
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
+
+log = logging.getLogger(__name__)
 
 _REQUIRED_KEYS = {"subject", "predicate", "object"}
 
@@ -65,7 +68,7 @@ class TrafficSemanticAbstractor:
     """
 
     def __init__(self, model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"):
-        print(f"Loading VLM: {model_id}...")
+        log.info("Loading VLM: %s", model_id)
 
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,
@@ -123,10 +126,13 @@ class TrafficSemanticAbstractor:
         self,
         frame_buffer: List[Image.Image],
         timestamp: float,
-        state_vectors: Dict[int, List[float]] = None,
-        warm_tracks: Set[int] = None,
-        behavior_summary: str = None,
+        state_vectors: Optional[Dict[int, List[float]]] = None,
+        warm_tracks: Optional[Set[int]] = None,
+        behavior_summary: Optional[str] = None,
         fps: float = 3.0,
+        tracked_boxes=None,
+        all_active_ids: Optional[List[int]] = None,
+        frame_id_timeline: Optional[List[tuple]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generates enriched SPO triples from a sequence of SoM frames.
@@ -176,11 +182,36 @@ class TrafficSemanticAbstractor:
             )
 
         # --- ID constraint ---------------------------------------------------
-        active_ids = sorted(state_vectors.keys()) if state_vectors else []
+        # Priority order:
+        # 1. all_active_ids — union of IDs across all frames in the buffer
+        #    (passed by _vlm_worker). This is the most complete list because
+        #    vehicles may appear in earlier frames but not the latest one.
+        # 2. tracked_boxes  — IDs from the current frame only (fallback).
+        # 3. state_vectors  — kinematics keys (last resort).
+        if all_active_ids is not None:
+            active_ids = sorted(all_active_ids)
+        elif tracked_boxes is not None:
+            active_ids = sorted({int(t[4]) for t in tracked_boxes})
+        elif state_vectors:
+            active_ids = sorted(state_vectors.keys())
+        else:
+            active_ids = []
+
+        # Per-frame presence timeline — tells the VLM exactly which vehicles
+        # existed at each point in the clip so it cannot describe interactions
+        # between vehicles that were never in the same frame.
+        timeline_block = ""
+        if frame_id_timeline:
+            lines = ["Vehicle presence per frame in this clip:"]
+            for i, (ts, ids) in enumerate(frame_id_timeline, 1):
+                marker = " ← current" if i == len(frame_id_timeline) else ""
+                lines.append(f"  Frame {i} (t={ts:.2f}s): Vehicles {ids}{marker}")
+            timeline_block = "\n".join(lines) + "\n"
+
         id_constraint = (
-            f"The ONLY valid vehicle IDs in this frame are: {active_ids}. "
-            "Use ONLY these exact IDs when referring to vehicles "
-            "(e.g. 'Vehicle 14', not 'Vehicle 1'). "
+            f"The ONLY valid vehicle IDs across this clip are: {active_ids}. "
+            "Use ONLY these exact IDs. "
+            + timeline_block
         ) if active_ids else ""
 
         # --- System prompt: CoT + richer schema ------------------------------
@@ -289,17 +320,17 @@ class TrafficSemanticAbstractor:
         # Layer 2: extract the first [...] array, tolerating CoT preamble
         match = re.search(r"\[.*\]", clean, re.DOTALL)
         if not match:
-            print(f"[VLM] No JSON array found at t={timestamp:.1f}s. Raw: {raw!r}")
+            log.warning("[VLM] No JSON array found at t=%.1fs. Raw: %r", timestamp, raw)
             return []
 
         try:
             triples = json.loads(match.group())
         except json.JSONDecodeError as exc:
-            print(f"[VLM] JSON parse error at t={timestamp:.1f}s: {exc}. Raw: {raw!r}")
+            log.warning("[VLM] JSON parse error at t=%.1fs: %s. Raw: %r", timestamp, exc, raw)
             return []
 
         if not isinstance(triples, list):
-            print(f"[VLM] Expected list, got {type(triples)} at t={timestamp:.1f}s.")
+            log.warning("[VLM] Expected list, got %s at t=%.1fs.", type(triples), timestamp)
             return []
 
         valid = []
@@ -325,6 +356,6 @@ class TrafficSemanticAbstractor:
 
         dropped = len(triples) - len(valid)
         if dropped:
-            print(f"[VLM] Dropped {dropped}/{len(triples)} malformed triples at t={timestamp:.1f}s.")
+            log.warning("[VLM] Dropped %d/%d malformed triples at t=%.1fs.", dropped, len(triples), timestamp)
 
         return valid
