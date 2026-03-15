@@ -1,3 +1,4 @@
+import json as _json
 import logging
 from pathlib import Path
 from typing import List, Dict, Any
@@ -72,6 +73,20 @@ class GraphClient:
                     from_window    STRING,
                     to_window      STRING,
                     gap_seconds    DOUBLE
+                )
+            """)
+        except RuntimeError:
+            pass  # Already exists
+
+        # HAS_VIOLATION — feedback loop: rule engine verdicts written back to graph.
+        # Makes violations queryable via Cypher alongside interaction edges.
+        try:
+            self.conn.execute("""
+                CREATE REL TABLE HAS_VIOLATION (
+                    FROM Vehicle TO Vehicle,
+                    violation_type STRING,
+                    time_window    STRING,
+                    evidence_json  STRING
                 )
             """)
         except RuntimeError:
@@ -258,6 +273,52 @@ class GraphClient:
                 )
             except Exception as exc:
                 log.warning("PRECEDES edge failed for %s: %s", name, exc)
+
+    def insert_violation(
+        self,
+        track_id: int,
+        violation_type: str,
+        time_window: str,
+        evidence: Dict[str, Any],
+    ) -> None:
+        """
+        Writes a rule engine verdict back to the graph as a HAS_VIOLATION
+        self-edge on the Vehicle node.
+
+        Closes the feedback loop between the symbolic rule engine and the
+        graph memory — violations become queryable Cypher facts:
+
+            MATCH (v:Vehicle {name:'Vehicle 4'})-[r:HAS_VIOLATION]->(v)
+            RETURN r.violation_type, r.time_window, r.evidence_json
+
+        Args:
+            track_id:       Integer vehicle ID.
+            violation_type: Rule name e.g. 'HARD_BRAKING', 'SPEEDING'.
+            time_window:    Time range string e.g. '0.0-9999999.0'.
+            evidence:       Dict of numeric evidence from the rule engine.
+        """
+        name = f"Vehicle {track_id}"
+        self._upsert_entity(name, "Vehicle")
+        try:
+            self.conn.execute(
+                """
+                MATCH (v:Vehicle {name: $name})
+                CREATE (v)-[:HAS_VIOLATION {
+                    violation_type: $vtype,
+                    time_window:    $window,
+                    evidence_json:  $evidence
+                }]->(v)
+                """,
+                parameters={
+                    "name":     name,
+                    "vtype":    violation_type,
+                    "window":   time_window,
+                    "evidence": _json.dumps(evidence),
+                },
+            )
+            log.info("HAS_VIOLATION written: Vehicle %d — %s", track_id, violation_type)
+        except Exception as exc:
+            log.warning("HAS_VIOLATION insert failed for Vehicle %d: %s", track_id, exc)
 
     def query_graph(self, cypher_query: str) -> List[Dict[str, Any]]:
         """

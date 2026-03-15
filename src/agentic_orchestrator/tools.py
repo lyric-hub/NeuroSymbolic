@@ -335,6 +335,19 @@ def evaluate_traffic_rules(
             "message": "No traffic rule violations detected in this time window.",
         }, indent=2)
 
+    # Feedback loop — write violations back to Kùzu so the graph has
+    # persistent memory of rule verdicts, queryable via Cypher.
+    time_window = f"{start_time}-{end_time}"
+    graph = _get_graph()
+    for v in violations:
+        vd = v.to_dict()
+        graph.insert_violation(
+            track_id=track_id,
+            violation_type=vd.get("violation_type", "UNKNOWN"),
+            time_window=time_window,
+            evidence=vd.get("evidence", {}),
+        )
+
     return json.dumps({
         "vehicle_id": track_id,
         "violation_count": len(violations),

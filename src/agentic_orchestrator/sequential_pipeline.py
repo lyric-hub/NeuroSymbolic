@@ -46,7 +46,7 @@ Symbolic: Savitzky-Golay + homography + Kùzu graph + DuckDB + ZoneManager +
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage  # HumanMessage used in initialize
 
 from .langgraph_state import AgentState
 from .hierarchical_router import _classify_intent
@@ -142,18 +142,98 @@ or about a vehicle's overall behaviour across the video.
 Base your final answer strictly on what the tools returned. Do not invent facts."""
 
 # ---------------------------------------------------------------------------
-# Planner prompt — produces an explicit investigation plan before ReAct.
+# Planner — deterministic template-based (Symbolic).
+# Maps query keywords to a fixed investigation sequence.
+# No LLM involved — output is always the same for the same query type.
 # ---------------------------------------------------------------------------
-_PLANNER_PROMPT = (
-    "You are a traffic analysis planning system. "
-    "Decompose the following query into a concrete, ordered investigation plan (3-5 steps max).\n\n"
-    "For each step specify which tool to use and what specific data to look for.\n\n"
-    "Available tools: search_semantic_events, search_entity_profiles, "
-    "query_graph_relationships, verify_physics_math, evaluate_traffic_rules, "
-    "query_zone_flow, search_vehicles_by_type\n\n"
-    "Query: {query}\n\n"
-    "Output a numbered list only. Be specific and concise."
+
+_PLAN_TEMPLATES = {
+    "vehicle_type": {
+        "keywords": [
+            "motorcycle", "two-wheel", "bicycle", "bike",
+            "buses", "trucks", "pedestrian", "person",
+            "vehicle type", "vehicles by type",
+        ],
+        "plan": (
+            "1. Call search_vehicles_by_type to find all track_ids of the requested class.\n"
+            "   For two-wheelers call it twice: 'motorcycle' then 'bicycle'.\n"
+            "2. Call verify_physics_math for each track_id.\n"
+            "3. Call evaluate_traffic_rules for each track_id.\n"
+            "4. Summarise behaviour patterns across all vehicles of this type."
+        ),
+    },
+    "incident": {
+        "keywords": [
+            "incident", "collision", "crash", "near-miss", "near miss",
+            "accident", "happened at", "t=", "what happened",
+        ],
+        "plan": (
+            "1. Call search_semantic_events to find the incident and time window.\n"
+            "2. Call query_graph_relationships with the returned time_window_pointer.\n"
+            "3. Call evaluate_traffic_rules for each involved vehicle.\n"
+            "4. Call verify_physics_math to confirm kinematics at the incident moment."
+        ),
+    },
+    "relational": {
+        "keywords": [
+            "interact", "relationship", "between", "conflict",
+            "following", "tailgat", "together",
+        ],
+        "plan": (
+            "1. Call search_semantic_events to find the relevant time window.\n"
+            "2. Call query_graph_relationships to find which vehicles interacted.\n"
+            "3. Call verify_physics_math for the involved vehicles."
+        ),
+    },
+    "behavioral": {
+        "keywords": [
+            "aggressive", "dangerous", "worst", "most",
+            "behaviour", "behavior", "profile", "erratic",
+        ],
+        "plan": (
+            "1. Call search_entity_profiles to find vehicles matching the description.\n"
+            "2. Call verify_physics_math to confirm kinematic evidence.\n"
+            "3. Call evaluate_traffic_rules for formal violation verdicts."
+        ),
+    },
+    "vehicle_specific": {
+        "keywords": ["vehicle ", "track id", "track_id"],
+        "plan": (
+            "1. Call search_semantic_events to find events involving this vehicle.\n"
+            "2. Call verify_physics_math to get kinematic statistics.\n"
+            "3. Call evaluate_traffic_rules to check for violations.\n"
+            "4. Call query_graph_relationships to find interactions with other vehicles."
+        ),
+    },
+    "flow": {
+        "keywords": [
+            "flow", "count", "zone", "gate", "entry", "exit",
+            "od matrix", "origin", "destination", "how many vehicles", "dwell",
+        ],
+        "plan": (
+            "1. Call query_zone_flow to get gate counts and OD pairs."
+        ),
+    },
+}
+
+_DEFAULT_PLAN = (
+    "1. Call search_semantic_events to find relevant events.\n"
+    "2. Call search_entity_profiles to find relevant vehicle profiles.\n"
+    "3. Call verify_physics_math for any identified vehicles.\n"
+    "4. Call evaluate_traffic_rules if violations are suspected."
 )
+
+
+def _select_plan(query: str) -> str:
+    """
+    Deterministic keyword matcher — returns the first matching plan template.
+    Falls back to _DEFAULT_PLAN if no keywords match.
+    """
+    q = query.lower()
+    for template in _PLAN_TEMPLATES.values():
+        if any(kw in q for kw in template["keywords"]):
+            return template["plan"]
+    return _DEFAULT_PLAN
 
 # ---------------------------------------------------------------------------
 # LLM — two bindings: full (all 5 tools) and semantic (search only).
@@ -178,25 +258,20 @@ def route_query(state: AgentState) -> AgentState:
 
 def planner_node(state: AgentState) -> AgentState:
     """
-    Planner node: decomposes the user's query into a structured investigation
-    plan BEFORE the ReAct loop begins.
+    Planner node: selects a deterministic investigation plan from
+    _PLAN_TEMPLATES using keyword matching on the query.
 
-    This is the meta-reasoning / symbolic planning layer.  By committing to a
-    plan upfront, the system's reasoning becomes transparent (the plan is stored
-    in state['plan'] and visible to callers) and the agent LLM is less likely
-    to skip steps or call tools redundantly.
+    This is the symbolic planning layer — no LLM is called here.
+    The plan is always the same for the same query type, making it
+    fully auditable and reproducible.
 
-    Only activated for 'full_analysis' queries.  Simple semantic lookups do
-    not need a plan.
+    Only activated for 'full_analysis' queries.
     """
     if state.get("route") != "full_analysis":
         return {"plan": ""}
 
-    response = llm.invoke(
-        [HumanMessage(content=_PLANNER_PROMPT.format(query=state["query"]))]
-    )
-    plan = response.content
-    print(f"\n📋 Analysis Plan:\n{plan}\n")
+    plan = _select_plan(state["query"])
+    print(f"\n📋 Analysis Plan (symbolic):\n{plan}\n")
     return {"plan": plan}
 
 
