@@ -1,15 +1,18 @@
 """
 LangGraph Agent Tools — Neuro-Symbolic Bridge
 ==============================================
-Six LangChain tools that expose the hybrid memory layer to the ReAct agent.
+Nine LangChain tools that expose the hybrid memory layer to the ReAct agent.
 Each tool maps to a distinct reasoning modality:
 
-  search_semantic_events    → Milvus ANN search (event-level)  (neural)
-  search_entity_profiles    → Milvus ANN search (vehicle-level) (neural)
-  query_graph_relationships → Kùzu Cypher traversal            (symbolic)
-  verify_physics_math       → DuckDB kinematic stats           (symbolic)
-  evaluate_traffic_rules    → Rule Engine                      (symbolic / deterministic)
-  query_zone_flow           → DuckDB OD analysis               (symbolic)
+  search_semantic_events      → Milvus ANN search (event-level)      (neural)
+  search_entity_profiles      → Milvus ANN search (vehicle-level)    (neural)
+  query_graph_relationships   → Kùzu Cypher traversal                (symbolic)
+  verify_physics_math         → DuckDB kinematic stats + landmark     (symbolic)
+  evaluate_traffic_rules      → Rule Engine                          (symbolic / deterministic)
+  query_zone_flow             → DuckDB OD analysis                   (symbolic)
+  get_vehicle_trajectory      → DuckDB spatial path reconstruction   (symbolic)
+  get_vehicle_proximity       → DuckDB min-distance between vehicles (symbolic)
+  compare_vehicle_kinematics  → DuckDB multi-vehicle stats           (symbolic)
 
 Tools are lazy-initialised: DB connections open on first use, not at
 import time, so the FastAPI server starts cleanly even when a DB is not
@@ -192,6 +195,12 @@ def verify_physics_math(start_time: float, end_time: float, track_id: int) -> st
     max_speed = float(df["_speed"].max())
     min_signed_accel = float(df["_signed_accel"].min())
 
+    # Position and nearest landmark at the moment of peak speed.
+    peak_row = df.loc[df["_speed"].idxmax()]
+    landmark, lm_dist = _get_duckdb().nearest_landmark(
+        float(peak_row["pos_x"]), float(peak_row["pos_y"])
+    )
+
     analysis = {
         "vehicle_id": track_id,
         "time_window": f"{start_time}-{end_time}",
@@ -199,6 +208,7 @@ def verify_physics_math(start_time: float, end_time: float, track_id: int) -> st
         "max_speed_kmh": round(max_speed * 3.6, 1),
         "min_signed_accel_ms2": round(min_signed_accel, 2),
         "hard_braking_detected": bool(min_signed_accel < -4.0),
+        "position_at_peak_speed": f"{lm_dist:.1f}m from {landmark}",
         "data_points": len(df),
     }
 
@@ -343,7 +353,7 @@ def evaluate_traffic_rules(
         vd = v.to_dict()
         graph.insert_violation(
             track_id=track_id,
-            violation_type=vd.get("violation_type", "UNKNOWN"),
+            violation_type=vd.get("rule_id", "UNKNOWN"),
             time_window=time_window,
             evidence=vd.get("evidence", {}),
         )
@@ -353,3 +363,169 @@ def evaluate_traffic_rules(
         "violation_count": len(violations),
         "violations": [v.to_dict() for v in violations],
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 7 — Spatial trajectory path (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_vehicle_trajectory(
+    track_id: int,
+    start_time: float,
+    end_time: float,
+) -> str:
+    """
+    Spatial Trajectory Reconstruction — full position sequence for a vehicle.
+
+    Returns a sampled sequence of (timestamp, pos_x, pos_y, speed, nearest_landmark)
+    so the agent can reconstruct WHERE a vehicle was at each moment, not just
+    peak statistics. Essential for accident spatial analysis.
+
+    Use AFTER verify_physics_math when you need to know the vehicle's path,
+    not just its peak speed — e.g. "was it in the intersection when it braked?"
+
+    Args:
+        track_id:   Integer vehicle ID.
+        start_time: Window start in seconds.
+        end_time:   Window end in seconds.
+    """
+    log.info(
+        "Tool: get_vehicle_trajectory | vehicle=%d, t=%.1f-%.1f",
+        track_id, start_time, end_time,
+    )
+    path = _get_duckdb().get_trajectory_path(track_id, start_time, end_time)
+
+    if not path:
+        return (
+            f"No trajectory data found for Vehicle {track_id} "
+            f"in t={start_time}–{end_time}s."
+        )
+
+    return json.dumps({
+        "vehicle_id": track_id,
+        "time_window": f"{start_time}-{end_time}",
+        "point_count": len(path),
+        "path": path,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 8 — Vehicle proximity (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_vehicle_proximity(
+    track_id_a: int,
+    track_id_b: int,
+    start_time: float,
+    end_time: float,
+) -> str:
+    """
+    Proximity Analysis — minimum tail-to-head gap between two vehicles.
+
+    Answers: "How close did Vehicle 4 get to Vehicle 9? Did they actually collide?"
+
+    Computes gap = centre_distance - half_length_A - half_length_B using
+    class-based vehicle dimensions (car≈4.5m, bus≈12m, motorcycle≈2m).
+    gap ≤ 0 means collision confirmed (bodies overlapping).
+    gap < 1m means near-miss.
+
+    Use AFTER query_graph_relationships identifies involved vehicles.
+
+    Args:
+        track_id_a: First vehicle ID.
+        track_id_b: Second vehicle ID.
+        start_time: Window start in seconds.
+        end_time:   Window end in seconds.
+
+    Returns JSON with: min_gap_m, centre_distance_m, collision_confirmed,
+    timestamp_s, vehicle_a/b_half_length_m, vehicle_a/b_pos.
+    """
+    log.info(
+        "Tool: get_vehicle_proximity | vehicles=%d,%d, t=%.1f-%.1f",
+        track_id_a, track_id_b, start_time, end_time,
+    )
+    result = _get_duckdb().get_vehicle_proximity(
+        track_id_a, track_id_b, start_time, end_time
+    )
+
+    if "error" in result:
+        return result["error"]
+
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 9 — Multi-vehicle kinematic comparison (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def compare_vehicle_kinematics(
+    track_ids_csv: str,
+    start_time: float,
+    end_time: float,
+) -> str:
+    """
+    Multi-Vehicle Kinematic Comparison — side-by-side stats for multiple vehicles.
+
+    Returns speed and acceleration statistics for all specified vehicles in
+    one call, aligned to the same time window. Essential for comparing
+    involved parties at the exact moment of an incident.
+
+    Use when you need to compare Vehicle 4 and Vehicle 9 simultaneously
+    rather than calling verify_physics_math separately for each.
+
+    Args:
+        track_ids_csv: Comma-separated vehicle IDs, e.g. "4,9" or "4,9,12".
+        start_time:    Window start in seconds.
+        end_time:      Window end in seconds.
+    """
+    log.info(
+        "Tool: compare_vehicle_kinematics | ids='%s', t=%.1f-%.1f",
+        track_ids_csv, start_time, end_time,
+    )
+    try:
+        ids = [int(x.strip()) for x in track_ids_csv.split(",") if x.strip()]
+    except ValueError:
+        return "Invalid track_ids_csv format. Use comma-separated integers e.g. '4,9'."
+
+    if not ids:
+        return "No vehicle IDs provided."
+
+    db = _get_duckdb()
+    results = []
+
+    for track_id in ids:
+        df = db.get_trajectory_window(start_time, end_time, track_id)
+        if df.empty:
+            results.append({
+                "vehicle_id": track_id,
+                "status": "no_data",
+                "time_window": f"{start_time}-{end_time}",
+            })
+            continue
+
+        df = df.copy()
+        df["_speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        df["_accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
+        dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
+        df["_signed_accel"] = df["_accel_mag"].where(dot >= 0, -df["_accel_mag"])
+
+        max_speed = float(df["_speed"].max())
+        min_accel = float(df["_signed_accel"].min())
+        peak_row = df.loc[df["_speed"].idxmax()]
+        landmark, lm_dist = db.nearest_landmark(float(peak_row["pos_x"]), float(peak_row["pos_y"]))
+
+        results.append({
+            "vehicle_id": track_id,
+            "time_window": f"{start_time}-{end_time}",
+            "max_speed_ms": round(max_speed, 2),
+            "max_speed_kmh": round(max_speed * 3.6, 1),
+            "min_signed_accel_ms2": round(min_accel, 2),
+            "hard_braking_detected": bool(min_accel < -4.0),
+            "position_at_peak_speed": f"{lm_dist:.1f}m from {landmark}",
+            "data_points": len(df),
+        })
+
+    return json.dumps(results, indent=2)

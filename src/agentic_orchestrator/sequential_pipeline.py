@@ -26,12 +26,15 @@ Agents and their roles
                             observes results, and repeats until it can answer.
 
 5. tools       (Neuro-Symbolic)  Executes the tool the LLM called:
-                 search_semantic_events    → Milvus ANN (event-level)    (neural)
-                 search_entity_profiles    → Milvus ANN (vehicle-level)  (neural)
-                 query_graph_relationships → Kùzu Cypher                 (symbolic)
-                 verify_physics_math       → DuckDB raw stats            (symbolic)
-                 evaluate_traffic_rules    → Rule engine                 (symbolic)
-                 query_zone_flow           → DuckDB OD analysis          (symbolic)
+                 search_semantic_events     → Milvus ANN (event-level)        (neural)
+                 search_entity_profiles     → Milvus ANN (vehicle-level)    (neural)
+                 query_graph_relationships  → Kùzu Cypher                   (symbolic)
+                 verify_physics_math        → DuckDB kinematic stats         (symbolic)
+                 evaluate_traffic_rules     → Rule engine                    (symbolic)
+                 query_zone_flow            → DuckDB OD analysis             (symbolic)
+                 get_vehicle_trajectory     → DuckDB spatial path            (symbolic)
+                 get_vehicle_proximity      → DuckDB min-distance            (symbolic)
+                 compare_vehicle_kinematics → DuckDB multi-vehicle stats     (symbolic)
 
 6. finalize    (Symbolic)   Extracts the last AIMessage as the final answer
                             and exposes it as state['final_summary'].
@@ -58,6 +61,9 @@ from .tools import (
     query_zone_flow,
     evaluate_traffic_rules,
     search_vehicles_by_type,
+    get_vehicle_trajectory,
+    get_vehicle_proximity,
+    compare_vehicle_kinematics,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,7 +77,10 @@ TOOLS_FULL = [
     verify_physics_math,
     evaluate_traffic_rules,
     query_zone_flow,
-    search_vehicles_by_type,  # Class-based vehicle lookup (motorcycle, car, bus…)
+    search_vehicles_by_type,       # Class-based vehicle lookup (motorcycle, car, bus…)
+    get_vehicle_trajectory,        # Full spatial path reconstruction per vehicle
+    get_vehicle_proximity,         # Min distance between two vehicles in a window
+    compare_vehicle_kinematics,    # Side-by-side stats for multiple vehicles
 ]
 TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
@@ -117,6 +126,21 @@ Available tools:
                                  "motorcycle", "car", "bus", "truck", "bicycle", "person".
                                  For "two-wheelers": call twice — "motorcycle" + "bicycle".
                                  Returns track_ids to use with tools 4 and 5.
+
+8. get_vehicle_trajectory      — Full spatial path reconstruction for one vehicle.
+                                 Returns sampled (timestamp, pos_x, pos_y, speed, nearest_landmark).
+                                 Use when you need to know WHERE a vehicle was at each moment,
+                                 not just peak speed. E.g. "was it in the intersection when it braked?"
+
+9. get_vehicle_proximity       — Tail-to-head gap between two vehicles (NOT centre-to-centre).
+                                 gap = centre_distance - half_length_A - half_length_B.
+                                 gap ≤ 0 → collision_confirmed=true.
+                                 Use to answer "did they actually collide?" after identifying involved vehicles.
+                                 Returns min_gap_m, collision_confirmed, timestamp_s, both vehicle positions.
+
+10. compare_vehicle_kinematics — Side-by-side kinematic stats for multiple vehicles.
+                                 Pass track_ids_csv e.g. "4,9" to get stats for both simultaneously.
+                                 Use instead of calling verify_physics_math twice for incident comparisons.
 
 Decision rules:
 - Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
@@ -165,13 +189,20 @@ _PLAN_TEMPLATES = {
     "incident": {
         "keywords": [
             "incident", "collision", "crash", "near-miss", "near miss",
-            "accident", "happened at", "t=", "what happened",
+            "accident", "happened at", "t=", "what happened", "reason",
+            "cause", "why", "led to", "before the",
         ],
         "plan": (
-            "1. Call search_semantic_events to find the incident and time window.\n"
-            "2. Call query_graph_relationships with the returned time_window_pointer.\n"
-            "3. Call evaluate_traffic_rules for each involved vehicle.\n"
-            "4. Call verify_physics_math to confirm kinematics at the incident moment."
+            "1. Call search_semantic_events to find the incident and its time_window_pointer (e.g. '10.0-15.0').\n"
+            "2. Call query_graph_relationships to find which vehicles interacted at that window:\n"
+            "   MATCH (s)-[r:INTERACTS_WITH]->(o) WHERE r.trajectory_time_window = '<window>' RETURN s.name, r.predicate, o.name, r.motion_state, r.phase\n"
+            "3. For each involved vehicle, traverse the PRECEDES chain to find pre-accident behaviour (up to 3 windows back):\n"
+            "   MATCH (v:Vehicle {name:'<name>'})-[r:PRECEDES*1..3]->(v2) WHERE r[-1].to_window = '<window>' RETURN r[*].from_window, r[*].to_window\n"
+            "4. Call compare_vehicle_kinematics with all involved vehicle IDs for the PRE-ACCIDENT window (start_time = incident_start - 15, end_time = incident_start) to compare speeds side-by-side.\n"
+            "5. Call get_vehicle_proximity with the two closest vehicles for the INCIDENT window to find the minimum distance and time of closest approach.\n"
+            "6. Call compare_vehicle_kinematics again for the INCIDENT window itself to confirm impact kinematics for all parties simultaneously.\n"
+            "7. Call evaluate_traffic_rules for each involved vehicle over the full range (pre-accident + incident) to detect violations that preceded the crash.\n"
+            "8. Synthesise: combine pre-accident behaviour, proximity data, rule violations, and impact kinematics to state the cause."
         ),
     },
     "relational": {

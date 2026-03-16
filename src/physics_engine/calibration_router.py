@@ -46,6 +46,7 @@ class PointPair(BaseModel):
     pixel_y: float
     world_x: float
     world_y: float
+    name: str = ""   # user-defined landmark name e.g. "Stop Line", "North Kerb"
 
 
 class ComputeRequest(BaseModel):
@@ -208,6 +209,24 @@ def compute_homography(request: ComputeRequest) -> ComputeResponse:
     point_errors = _compute_reprojection_errors(image_pts, world_pts, H)
     rmse = float(np.sqrt(np.mean([e.error_px ** 2 for e in point_errors])))
 
+    # Build named_points list — every point pair with its user-assigned name.
+    # Fallback name is "Point N" for any point left unnamed.
+    named_points = [
+        {
+            "name": p.name.strip() or f"Point {i + 1}",
+            "world_x": p.world_x,
+            "world_y": p.world_y,
+        }
+        for i, p in enumerate(request.point_pairs)
+    ]
+
+    # The reference point is whichever named point sits at (0, 0).
+    # If none is exactly at origin, fall back to the first point.
+    ref = next(
+        (p for p in named_points if p["world_x"] == 0.0 and p["world_y"] == 0.0),
+        named_points[0],
+    )
+
     calibration_data = {
         "homography": H.tolist(),
         "image_points": image_pts.tolist(),
@@ -215,6 +234,12 @@ def compute_homography(request: ComputeRequest) -> ComputeResponse:
         "video_path": request.video_path,
         "frame_idx": request.frame_idx,
         "rmse_meters": round(rmse, 4),
+        "named_points": named_points,
+        "reference_point": {
+            "name": ref["name"],
+            "world_x": ref["world_x"],
+            "world_y": ref["world_y"],
+        },
     }
     with open(CALIBRATION_FILE, "w") as f:
         yaml.dump(calibration_data, f)

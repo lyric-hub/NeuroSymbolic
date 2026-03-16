@@ -86,22 +86,37 @@ class TrafficSemanticAbstractor:
     def _build_physics_block(
         state_vectors: Dict[int, List[float]],
         warm_tracks: Set[int],
+        reference_name: str = "Origin",
+        nearest_landmark_fn=None,
     ) -> str:
         """
         Converts kinematics state_vectors to a readable text block.
+
+        When nearest_landmark_fn is provided (from CoordinateTransformer),
+        positions are described as "X.Xm from <closest landmark name>".
+        Otherwise falls back to cardinal-direction format relative to origin.
 
         Tracks not yet in warm_tracks have unreliable velocity/acceleration
         estimates (fewer than window_length samples). They are labelled
         "(initialising)" to prevent the VLM from treating a cold-start
         zero velocity as a genuine stop.
         """
+        def _pos_str(x: float, y: float) -> str:
+            if nearest_landmark_fn is not None:
+                lm_name, lm_dist = nearest_landmark_fn(x, y)
+                return f"{lm_dist:.1f}m from {lm_name}"
+            x_dir = "E" if x >= 0 else "W"
+            y_dir = "N" if y >= 0 else "S"
+            return f"{abs(x):.1f}m {x_dir}, {abs(y):.1f}m {y_dir} of {reference_name}"
+
         lines = []
         for track_id, sv in state_vectors.items():
             x, y, vx, vy, ax, ay = sv
+            pos = _pos_str(x, y)
             if track_id not in warm_tracks:
                 lines.append(
                     f"  Vehicle {track_id}: "
-                    f"position=({x:.1f}m, {y:.1f}m), "
+                    f"position=({pos}), "
                     f"speed=(initialising — not enough frames yet), "
                     f"acceleration=(initialising)"
                 )
@@ -112,7 +127,7 @@ class TrafficSemanticAbstractor:
             signed_accel = -accel if dot < 0 else accel
             lines.append(
                 f"  Vehicle {track_id}: "
-                f"position=({x:.1f}m, {y:.1f}m), "
+                f"position=({pos}), "
                 f"speed={speed:.1f} m/s, "
                 f"acceleration={signed_accel:+.1f} m/s²"
             )
@@ -133,6 +148,8 @@ class TrafficSemanticAbstractor:
         tracked_boxes=None,
         all_active_ids: Optional[List[int]] = None,
         frame_id_timeline: Optional[List[tuple]] = None,
+        reference_name: str = "Origin",
+        nearest_landmark_fn=None,
     ) -> List[Dict[str, Any]]:
         """
         Generates enriched SPO triples from a sequence of SoM frames.
@@ -177,7 +194,10 @@ class TrafficSemanticAbstractor:
             physics_block = (
                 "\nVerified physics data from the tracking engine "
                 "(use this to ground your analysis — do not contradict it):\n"
-                + self._build_physics_block(state_vectors, warm_tracks or set())
+                + self._build_physics_block(
+                    state_vectors, warm_tracks or set(),
+                    reference_name, nearest_landmark_fn,
+                )
                 + "\n"
             )
 

@@ -96,7 +96,6 @@ def _run_job(job_id: str, video_path: str, run_physics: bool = True, run_vlm: bo
         process_video(
             video_path,
             progress_callback=on_progress,
-            alert_callback=_on_pipeline_alert,
             run_physics=run_physics,
             run_vlm=run_vlm,
             model_path=model_path or _latest_model(),

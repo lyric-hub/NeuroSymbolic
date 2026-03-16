@@ -107,25 +107,6 @@ class GraphClient:
             except Exception:
                 pass  # Column already present in this DB version
 
-        # PRECEDES: temporal continuity edge on the same vehicle node.
-        # Self-edge (Vehicle → Vehicle with the same name) linking consecutive
-        # time windows. Properties encode which windows are connected and how
-        # much time elapsed between them, enabling temporal path queries:
-        #
-        #   MATCH (v:Vehicle {name:'Vehicle 4'})-[r:PRECEDES*1..4]->(v2)
-        #   RETURN r.from_window, r.to_window ORDER BY r.from_window
-        try:
-            self.conn.execute("""
-                CREATE REL TABLE PRECEDES (
-                    FROM Vehicle TO Vehicle,
-                    FROM Pedestrian TO Pedestrian,
-                    from_window    STRING,
-                    to_window      STRING,
-                    gap_seconds    DOUBLE
-                )
-            """)
-        except RuntimeError:
-            pass  # Already exists
 
     def _upsert_entity(self, entity_name: str, entity_type: str):
         """

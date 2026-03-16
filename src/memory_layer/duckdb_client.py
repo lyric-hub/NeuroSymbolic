@@ -88,6 +88,17 @@ class DuckDBClient:
             )
         """)
 
+        # Calibration metadata — stores all named calibration landmarks so that
+        # positions can be described relative to the nearest known landmark.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS calibration_metadata (
+                name      VARCHAR,
+                world_x   DOUBLE,
+                world_y   DOUBLE,
+                is_origin BOOLEAN
+            )
+        """)
+
     def insert_state_vectors(
         self,
         timestamp: float,
@@ -265,11 +276,13 @@ class DuckDBClient:
                 }
                 parts.append(label_map[state])
 
-            # Append current speed/accel at the last row
+            # Append current speed/accel + nearest landmark at the last row
             last = df.iloc[-1]
+            lm_name, lm_dist = self.nearest_landmark(float(last["pos_x"]), float(last["pos_y"]))
             current_str = (
                 f"now: speed={last['speed']:.1f} m/s, "
-                f"accel={last['signed_accel']:+.1f} m/s²"
+                f"accel={last['signed_accel']:+.1f} m/s², "
+                f"position={lm_dist:.1f}m from {lm_name}"
             )
             narrative = " → ".join(parts) + f" | {current_str}"
             lines.append(f"  Vehicle {tid}: {narrative}")
@@ -418,6 +431,194 @@ class DuckDBClient:
                 _json.dumps(alert.evidence),
             ),
         )
+
+    def set_named_points(
+        self,
+        named_points: list,
+        reference_name: str,
+    ) -> None:
+        """
+        Persists all named calibration landmarks from the CoordinateTransformer.
+
+        Called once at pipeline startup. Replaces any existing entries.
+
+        Args:
+            named_points:   List of dicts with keys: name, world_x, world_y.
+            reference_name: Name of the (0, 0) origin point.
+        """
+        self.conn.execute("DELETE FROM calibration_metadata")
+        for pt in named_points:
+            self.conn.execute(
+                "INSERT INTO calibration_metadata VALUES (?, ?, ?, ?)",
+                (
+                    pt["name"],
+                    pt["world_x"],
+                    pt["world_y"],
+                    pt["name"] == reference_name,
+                ),
+            )
+
+    def get_reference_name(self) -> str:
+        """
+        Returns the name of the origin (is_origin=true) landmark.
+        Falls back to 'Origin' if not yet set.
+        """
+        row = self.conn.execute(
+            "SELECT name FROM calibration_metadata WHERE is_origin = true LIMIT 1"
+        ).fetchone()
+        return row[0] if row else "Origin"
+
+    def get_named_points(self) -> List[dict]:
+        """Returns all named calibration landmarks from calibration_metadata."""
+        rows = self.conn.execute(
+            "SELECT name, world_x, world_y FROM calibration_metadata ORDER BY is_origin DESC"
+        ).fetchall()
+        return [{"name": r[0], "world_x": r[1], "world_y": r[2]} for r in rows]
+
+    def nearest_landmark(self, x: float, y: float) -> tuple:
+        """
+        Returns (landmark_name, distance_metres) of the closest named calibration point.
+        Falls back to ('Origin', distance) when no landmarks are stored.
+        """
+        points = self.get_named_points()
+        if not points:
+            return "Origin", round((x ** 2 + y ** 2) ** 0.5, 2)
+        best_name, best_dist = "Origin", float("inf")
+        for pt in points:
+            dx = x - pt["world_x"]
+            dy = y - pt["world_y"]
+            dist = (dx ** 2 + dy ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_name = pt["name"]
+        return best_name, round(best_dist, 2)
+
+    def get_trajectory_path(
+        self,
+        track_id: int,
+        start_time: float,
+        end_time: float,
+        max_rows: int = 50,
+    ) -> List[dict]:
+        """
+        Returns a sampled sequence of (timestamp, pos_x, pos_y, speed, nearest_landmark)
+        for a vehicle over a time window.
+
+        Used by get_vehicle_trajectory tool for spatial reconstruction.
+
+        Args:
+            track_id:   Vehicle track ID.
+            start_time: Window start in seconds.
+            end_time:   Window end in seconds.
+            max_rows:   Maximum number of rows to return (sampled evenly).
+
+        Returns:
+            List of dicts: timestamp, pos_x, pos_y, speed_ms,
+                           nearest_landmark, distance_to_landmark_m.
+        """
+        self._flush()
+        df = self.get_trajectory_window(start_time, end_time, track_id)
+        if df.empty:
+            return []
+        step = max(1, len(df) // max_rows)
+        sampled = df.iloc[::step].copy()
+        sampled["_speed"] = (sampled["vel_x"] ** 2 + sampled["vel_y"] ** 2) ** 0.5
+        result = []
+        for _, row in sampled.iterrows():
+            lm, dist = self.nearest_landmark(float(row["pos_x"]), float(row["pos_y"]))
+            result.append({
+                "timestamp": round(float(row["timestamp"]), 2),
+                "pos_x": round(float(row["pos_x"]), 2),
+                "pos_y": round(float(row["pos_y"]), 2),
+                "speed_ms": round(float(row["_speed"]), 2),
+                "nearest_landmark": lm,
+                "distance_to_landmark_m": dist,
+            })
+        return result
+
+    # Standard half-lengths (metres) per YOLO class — used to convert
+    # centre-to-centre distance into the physically meaningful tail-to-head gap.
+    _HALF_LENGTH: Dict[str, float] = {
+        "car":        2.25,
+        "motorcycle": 1.00,
+        "bicycle":    0.90,
+        "bus":        6.00,
+        "truck":      4.00,
+        "person":     0.45,
+    }
+    _DEFAULT_HALF_LENGTH = 2.25  # fallback if class unknown
+
+    def _half_length(self, track_id: int, start_time: float, end_time: float) -> float:
+        """Returns the half-length (m) for a vehicle based on its YOLO class label."""
+        row = self.conn.execute(
+            """
+            SELECT class_label FROM vehicle_trajectories
+            WHERE track_id = ? AND timestamp >= ? AND timestamp <= ?
+            LIMIT 1
+            """,
+            (track_id, start_time, end_time),
+        ).fetchone()
+        label = (row[0] or "").lower() if row else ""
+        for key, half in self._HALF_LENGTH.items():
+            if key in label:
+                return half
+        return self._DEFAULT_HALF_LENGTH
+
+    def get_vehicle_proximity(
+        self,
+        track_id_a: int,
+        track_id_b: int,
+        start_time: float,
+        end_time: float,
+    ) -> dict:
+        """
+        Finds the minimum tail-to-head gap between two vehicles within a time window.
+
+        Uses centre-to-centre distance minus each vehicle's half-length so the
+        result represents the actual clearance between vehicle bodies — not the
+        distance between their geometric centres.
+
+        gap = centre_distance - half_length_A - half_length_B
+        gap ≤ 0  → collision (bodies overlapping)
+        gap < 1m → near-miss
+
+        Uses pandas merge_asof to align trajectories on nearest timestamp.
+
+        Returns:
+            Dict with min_gap_m, centre_distance_m, timestamp_s,
+            vehicle_a_pos, vehicle_b_pos, collision_confirmed.
+            On missing data: {"error": "..."}.
+        """
+        import pandas as pd
+        self._flush()
+        df_a = self.get_trajectory_window(start_time, end_time, track_id_a)
+        df_b = self.get_trajectory_window(start_time, end_time, track_id_b)
+        if df_a.empty or df_b.empty:
+            return {"error": f"No data for one or both vehicles (ids={track_id_a},{track_id_b}) in t={start_time}-{end_time}s."}
+
+        half_a = self._half_length(track_id_a, start_time, end_time)
+        half_b = self._half_length(track_id_b, start_time, end_time)
+
+        df_a = df_a.sort_values("timestamp").reset_index(drop=True)
+        df_b = df_b.sort_values("timestamp").reset_index(drop=True)
+        merged = pd.merge_asof(df_a, df_b, on="timestamp", suffixes=("_a", "_b"), direction="nearest")
+        merged["_centre_dist"] = ((merged["pos_x_a"] - merged["pos_x_b"]) ** 2 + (merged["pos_y_a"] - merged["pos_y_b"]) ** 2) ** 0.5
+        merged["_gap"] = merged["_centre_dist"] - half_a - half_b
+
+        min_idx = merged["_gap"].idxmin()
+        min_row = merged.loc[min_idx]
+        min_gap = float(min_row["_gap"])
+
+        return {
+            "min_gap_m": round(min_gap, 2),
+            "centre_distance_m": round(float(min_row["_centre_dist"]), 2),
+            "collision_confirmed": bool(min_gap <= 0.0),
+            "timestamp_s": round(float(min_row["timestamp"]), 2),
+            "vehicle_a_half_length_m": half_a,
+            "vehicle_b_half_length_m": half_b,
+            "vehicle_a_pos": {"x": round(float(min_row["pos_x_a"]), 2), "y": round(float(min_row["pos_y_a"]), 2)},
+            "vehicle_b_pos": {"x": round(float(min_row["pos_x_b"]), 2), "y": round(float(min_row["pos_y_b"]), 2)},
+        }
 
     def close(self) -> None:
         """Flushes any remaining buffered rows and closes the database connection."""

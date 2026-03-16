@@ -188,6 +188,22 @@ class TestGraphClient:
         result = graph.query_graph("MATCH (n:Vehicle) RETURN COUNT(n) AS c")
         assert result[0]["c"] == 0
 
+    def test_insert_violation(self, graph):
+        """HAS_VIOLATION self-edge must be queryable after insert_violation."""
+        graph.insert_violation(
+            track_id=4,
+            violation_type="SPEEDING",
+            time_window="0.0-15.0",
+            evidence={"peak_speed_kmh": 70.0, "limit_kmh": 50.0},
+        )
+        result = graph.query_graph(
+            "MATCH (v:Vehicle {name: 'Vehicle 4'})-[r:HAS_VIOLATION]->(v2:Vehicle) "
+            "RETURN r.violation_type, r.time_window"
+        )
+        assert len(result) >= 1
+        assert result[0]["r.violation_type"] == "SPEEDING"
+        assert result[0]["r.time_window"] == "0.0-15.0"
+
     def test_time_window_filter(self, graph):
         """Querying by trajectory_time_window must return only that window."""
         graph.insert_vlm_triples([{
@@ -215,6 +231,93 @@ class TestGraphClient:
         names = [r["s.name"] for r in result]
         assert "Vehicle 5" in names
         assert "Vehicle 7" not in names
+
+
+# ---------------------------------------------------------------------------
+# DuckDB named-points / landmark tests
+# ---------------------------------------------------------------------------
+
+class TestDuckDBNamedPoints:
+    @pytest.fixture
+    def db(self, tmp_db_dir: Path):
+        from src.memory_layer.duckdb_client import DuckDBClient
+        client = DuckDBClient(db_path=str(tmp_db_dir / "named.duckdb"))
+        yield client
+        client.close()
+
+    def test_set_and_get_named_points(self, db):
+        points = [
+            {"name": "Stop Line", "world_x": 0.0, "world_y": 0.0},
+            {"name": "North Kerb", "world_x": 5.0, "world_y": 10.0},
+        ]
+        db.set_named_points(points, reference_name="Stop Line")
+        result = db.get_named_points()
+        assert len(result) == 2
+        names = {r["name"] for r in result}
+        assert "Stop Line" in names
+        assert "North Kerb" in names
+
+    def test_nearest_landmark_exact_origin(self, db):
+        points = [
+            {"name": "Stop Line", "world_x": 0.0, "world_y": 0.0},
+            {"name": "North Kerb", "world_x": 5.0, "world_y": 10.0},
+        ]
+        db.set_named_points(points, reference_name="Stop Line")
+        name, dist = db.nearest_landmark(0.0, 0.0)
+        assert name == "Stop Line"
+        assert dist == pytest.approx(0.0)
+
+    def test_nearest_landmark_selects_closer(self, db):
+        points = [
+            {"name": "A", "world_x": 0.0, "world_y": 0.0},
+            {"name": "B", "world_x": 10.0, "world_y": 0.0},
+        ]
+        db.set_named_points(points, reference_name="A")
+        name, dist = db.nearest_landmark(8.0, 0.0)
+        assert name == "B"
+        assert dist == pytest.approx(2.0)
+
+    def test_nearest_landmark_fallback_no_points(self, db):
+        # No named points stored — should fall back to Origin + Euclidean distance
+        name, dist = db.nearest_landmark(3.0, 4.0)
+        assert name == "Origin"
+        assert dist == pytest.approx(5.0)
+
+    def test_get_reference_name(self, db):
+        db.set_named_points(
+            [{"name": "Crossing", "world_x": 0.0, "world_y": 0.0}],
+            reference_name="Crossing",
+        )
+        assert db.get_reference_name() == "Crossing"
+
+    def test_set_named_points_replaces_existing(self, db):
+        db.set_named_points(
+            [{"name": "Old", "world_x": 1.0, "world_y": 1.0}],
+            reference_name="Old",
+        )
+        db.set_named_points(
+            [{"name": "New", "world_x": 2.0, "world_y": 2.0}],
+            reference_name="New",
+        )
+        result = db.get_named_points()
+        assert len(result) == 1
+        assert result[0]["name"] == "New"
+
+    def test_behavior_summary_includes_landmark(self, db):
+        """get_behavior_summary must include landmark in output when named points are set."""
+        db.set_named_points(
+            [{"name": "Stop Line", "world_x": 0.0, "world_y": 0.0}],
+            reference_name="Stop Line",
+        )
+        for i in range(10):
+            db.insert_state_vectors(
+                timestamp=float(i) * 0.1,
+                frame_id=i,
+                state_vectors={1: [0.5, 0.5, 5.0, 0.0, 0.0, 0.0]},
+            )
+        db._flush()
+        summary = db.get_behavior_summary(track_ids=[1], current_time=1.0)
+        assert "Stop Line" in summary
 
 
 # ---------------------------------------------------------------------------

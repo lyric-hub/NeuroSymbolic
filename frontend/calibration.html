@@ -562,11 +562,12 @@
                         <th>Pixel (x, y)</th>
                         <th id="col3Head">World X (m)</th>
                         <th id="col4Head">World Y (m)</th>
+                        <th>Name</th>
                         <th></th>
                     </tr>
                 </thead>
                 <tbody id="pointsBody">
-                    <tr><td colspan="5" class="no-points">No points placed yet.</td></tr>
+                    <tr><td colspan="6" class="no-points">No points placed yet.</td></tr>
                 </tbody>
             </table>
             <button class="btn-secondary" id="clearBtn" style="margin-top:12px;">Clear all points</button>
@@ -888,15 +889,16 @@ canvas.addEventListener("click", (e) => {
     const px = (e.clientX - rect.left)  * scaleX;
     const py = (e.clientY - rect.top)   * scaleY;
 
-    const newPt = { pixelX: px, pixelY: py, worldX: "", worldY: "", lat: "", lon: "" };
+    const newPt = { pixelX: px, pixelY: py, worldX: "", worldY: "", lat: "", lon: "", name: "" };
 
-    // In GE mode: auto-assign next unassigned KML placemark
+    // In GE mode: auto-assign next unassigned KML placemark (and pre-fill its name)
     if (state.mode === "gearth") {
         const nextKML = state.kmlQueue.find(p => !p.assigned);
         if (nextKML) {
-            newPt.lat = nextKML.lat;
-            newPt.lon = nextKML.lon;
-            nextKML.assigned  = true;
+            newPt.lat  = nextKML.lat;
+            newPt.lon  = nextKML.lon;
+            newPt.name = nextKML.name;
+            nextKML.assigned   = true;
             nextKML.assignedTo = state.points.length + 1;
             renderKMLList();
         }
@@ -918,7 +920,7 @@ function renderTable() {
     if (state.mode === "gearth") updateOriginInfo(state.points);
 
     if (state.points.length === 0) {
-        pointsBody.innerHTML = `<tr><td colspan="5" class="no-points">No points placed yet.</td></tr>`;
+        pointsBody.innerHTML = `<tr><td colspan="6" class="no-points">No points placed yet.</td></tr>`;
         return;
     }
 
@@ -936,6 +938,11 @@ function renderTable() {
                     <input class="world-input" type="number" step="0.1"
                         value="${pt.worldY}" placeholder="0.0"
                         data-idx="${i}" data-axis="worldY">
+                </td>
+                <td>
+                    <input class="world-input" type="text" style="width:90px;"
+                        value="${pt.name}" placeholder="e.g. Stop Line"
+                        data-idx="${i}" data-axis="name">
                 </td>
                 <td><button class="delete-btn" data-idx="${i}" title="Remove">✕</button></td>
             </tr>
@@ -955,17 +962,24 @@ function renderTable() {
                         value="${pt.lon}" placeholder="lon"
                         data-idx="${i}" data-axis="lon">
                 </td>
+                <td>
+                    <input class="world-input" type="text" style="width:90px;"
+                        value="${pt.name}" placeholder="e.g. Stop Line"
+                        data-idx="${i}" data-axis="name">
+                </td>
                 <td><button class="delete-btn" data-idx="${i}" title="Remove">✕</button></td>
             </tr>
         `).join("");
     }
 
-    // Bind input changes
+    // Bind input changes — name axis stays as string, all others parsed as float
     pointsBody.querySelectorAll(".world-input").forEach(input => {
         input.addEventListener("change", (e) => {
             const idx  = parseInt(e.target.dataset.idx);
             const axis = e.target.dataset.axis;
-            state.points[idx][axis] = parseFloat(e.target.value) || 0;
+            state.points[idx][axis] = axis === "name"
+                ? e.target.value
+                : (parseFloat(e.target.value) || 0);
             if (state.mode === "gearth") updateOriginInfo(state.points);
             redraw();
         });
@@ -1006,6 +1020,7 @@ computeBtn.addEventListener("click", async () => {
         pointPairs = state.points.map(p => ({
             pixel_x: p.pixelX, pixel_y: p.pixelY,
             world_x: p.worldX, world_y: p.worldY,
+            name: p.name || "",
         }));
     } else {
         // Google Earth mode — convert lat/lon → metres
@@ -1015,7 +1030,7 @@ computeBtn.addEventListener("click", async () => {
         const origin = computeOrigin(state.points);
         pointPairs = state.points.map(p => {
             const { x, y } = latlngToMetres(p.lat, p.lon, origin.lat, origin.lon);
-            return { pixel_x: p.pixelX, pixel_y: p.pixelY, world_x: x, world_y: y };
+            return { pixel_x: p.pixelX, pixel_y: p.pixelY, world_x: x, world_y: y, name: p.name || "" };
         });
     }
 

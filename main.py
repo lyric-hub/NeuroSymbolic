@@ -46,6 +46,8 @@ def _vlm_worker(
     task_queue: queue_module.Queue,
     stop_event: threading.Event,
     metrics: Optional["MetricsCollector"],
+    reference_name: str = "Origin",
+    nearest_landmark_fn=None,
 ) -> None:
     """
     Background thread: drains semantic tasks enqueued by the physics loop.
@@ -122,6 +124,8 @@ def _vlm_worker(
                 tracked_boxes=tracked_boxes,
                 all_active_ids=all_active_ids,
                 frame_id_timeline=frame_id_timeline,
+                reference_name=reference_name,
+                nearest_landmark_fn=nearest_landmark_fn,
             )
         if metrics is not None:
             metrics.record_vlm_call(
@@ -234,6 +238,12 @@ def process_video(
     if run_physics:
         transformer = CoordinateTransformer("calibration.yaml")
         kinematics = KinematicEstimator(fps=float(fps))
+        duckdb_client.set_named_points(transformer.named_points, transformer.reference_name)
+        log.info(
+            "Reference point: '%s' | Named landmarks: %s",
+            transformer.reference_name,
+            [p["name"] for p in transformer.named_points],
+        )
 
     # --- Motion-energy gating --------------------------------------------
     # Skip the VLM call on frames where the scene is effectively static
@@ -263,9 +273,11 @@ def process_video(
         # than accumulating unbounded memory.
         _vlm_queue: queue_module.Queue = queue_module.Queue(maxsize=4)
         _vlm_stop = threading.Event()
+        _ref_name = transformer.reference_name if run_physics else "Origin"
+        _nearest_fn = transformer.nearest_landmark if run_physics else None
         _vlm_thread = threading.Thread(
             target=_vlm_worker,
-            args=(_vlm_queue, _vlm_stop, metrics),
+            args=(_vlm_queue, _vlm_stop, metrics, _ref_name, _nearest_fn),
             name="vlm-worker",
             daemon=True,
         )

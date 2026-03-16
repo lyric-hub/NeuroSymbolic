@@ -35,6 +35,10 @@ class CoordinateTransformer:
             with open(calibration_file, "r") as f:
                 calib_data = yaml.safe_load(f)
             self.H = np.array(calib_data["homography"], dtype=np.float32)
+            ref = calib_data.get("reference_point", {})
+            self.reference_name: str = ref.get("name", "Origin")
+            # All named landmarks — used for nearest-point position descriptions.
+            self.named_points: list = calib_data.get("named_points", [])
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Calibration file '{calibration_file}' not found. "
@@ -80,3 +84,32 @@ class CoordinateTransformer:
             )
 
         return real_world_positions
+
+    def nearest_landmark(self, x: float, y: float) -> Tuple[str, float]:
+        """
+        Returns the name and distance (metres) of the closest named calibration
+        point to the given real-world coordinate.
+
+        Falls back to ("Origin", distance) when no named points are loaded
+        (e.g. old calibration files without the named_points key).
+
+        Args:
+            x: Real-world X position (metres).
+            y: Real-world Y position (metres).
+
+        Returns:
+            Tuple of (landmark_name, distance_metres).
+        """
+        if not self.named_points:
+            dist = float(np.sqrt(x ** 2 + y ** 2))
+            return self.reference_name, round(dist, 2)
+
+        best_name, best_dist = self.reference_name, float("inf")
+        for pt in self.named_points:
+            dx = x - pt["world_x"]
+            dy = y - pt["world_y"]
+            dist = float(np.sqrt(dx ** 2 + dy ** 2))
+            if dist < best_dist:
+                best_dist = dist
+                best_name = pt["name"]
+        return best_name, round(best_dist, 2)
