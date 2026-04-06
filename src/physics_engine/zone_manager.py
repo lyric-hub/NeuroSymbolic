@@ -70,7 +70,8 @@ Example ``zone_config.json``::
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -94,6 +95,15 @@ class ZoneConfig:
     zone_id: str
     polygon: List[Tuple[float, float]]  # closed polygon in pixel coordinates
     gates: List[Gate]
+    speed_limit_kmh: float = 50.0
+    """Posted speed limit inside this zone (km/h). Overrides the global 50 km/h
+    default in TrafficRuleEngine so school zones, highway ramps etc. use the
+    correct threshold automatically."""
+    flow_direction_deg: Optional[float] = None
+    """Expected direction of travel through the zone in degrees using the
+    standard mathematical convention (0° = East, 90° = North CCW).
+    When set, the rule engine checks for wrong-way vehicles whose heading
+    differs from this by more than 90°.  Leave None to disable the check."""
 
     @classmethod
     def from_json(cls, path: str = "zone_config.json") -> "ZoneConfig":
@@ -105,12 +115,24 @@ class ZoneConfig:
             for g in data.get("gates", [])
         ]
         polygon = [tuple(pt) for pt in data.get("polygon", [])]
-        return cls(zone_id=data["zone_id"], polygon=polygon, gates=gates)
+        return cls(
+            zone_id=data["zone_id"],
+            polygon=polygon,
+            gates=gates,
+            speed_limit_kmh=float(data.get("speed_limit_kmh", 50.0)),
+            flow_direction_deg=(
+                float(data["flow_direction_deg"])
+                if data.get("flow_direction_deg") is not None
+                else None
+            ),
+        )
 
     def to_json(self, path: str = "zone_config.json") -> None:
         """Serialises the zone configuration to a JSON file."""
         data = {
             "zone_id": self.zone_id,
+            "speed_limit_kmh": self.speed_limit_kmh,
+            "flow_direction_deg": self.flow_direction_deg,
             "polygon": [list(pt) for pt in self.polygon],
             "gates": [
                 {"name": g.name, "p1": list(g.p1), "p2": list(g.p2)}

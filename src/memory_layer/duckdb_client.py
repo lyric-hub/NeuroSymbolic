@@ -620,6 +620,596 @@ class DuckDBClient:
             "vehicle_b_pos": {"x": round(float(min_row["pos_x_b"]), 2), "y": round(float(min_row["pos_y_b"]), 2)},
         }
 
+    # ------------------------------------------------------------------
+    # Interval-based trajectory sampling
+    # ------------------------------------------------------------------
+
+    def get_sampled_trajectory(
+        self,
+        track_id: int,
+        interval_secs: float = 0.5,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> List[dict]:
+        """
+        Returns one data snapshot per time interval for a single vehicle.
+
+        Instead of returning every frame (~30 rows/sec), this picks the
+        first row that falls inside each fixed-width time bucket:
+
+            bucket_start = FLOOR(timestamp / interval) * interval
+
+        So for interval=0.5 you get rows at t≈0.0, 0.5, 1.0, 1.5 …
+        exactly one row per bucket, regardless of source frame rate.
+
+        Each row is enriched with derived fields (speed, signed acceleration,
+        nearest landmark) so the output is ready for export or display without
+        further processing.
+
+        Args:
+            track_id:      Vehicle track ID.
+            interval_secs: Bucket width in seconds (default 0.5 s).
+                           Valid range: 0.05 s – 3600 s.
+            start_time:    Start of the query window (seconds).
+            end_time:      End of the query window (seconds).
+
+        Returns:
+            List of dicts, one per interval bucket, keys:
+                time_bucket, timestamp, track_id, class_label,
+                pos_x, pos_y, vel_x, vel_y, accel_x, accel_y,
+                speed_ms, signed_accel_ms2,
+                nearest_landmark, distance_to_landmark_m.
+        """
+        interval_secs = float(interval_secs)
+        if not (0.05 <= interval_secs <= 3600.0):
+            raise ValueError(f"interval_secs must be between 0.05 and 3600, got {interval_secs}")
+
+        self._flush()
+
+        # FLOOR bucketing: pick the earliest sample in each time bucket.
+        # arg_min(col, timestamp) returns the value of col at the row
+        # where timestamp is minimum — deterministic, no random tie-breaking.
+        iv = interval_secs  # float literal — safe for numeric f-string injection
+        query = f"""
+            SELECT
+                FLOOR(timestamp / {iv}) * {iv}  AS time_bucket,
+                arg_min(timestamp,  timestamp)   AS timestamp,
+                arg_min(pos_x,      timestamp)   AS pos_x,
+                arg_min(pos_y,      timestamp)   AS pos_y,
+                arg_min(vel_x,      timestamp)   AS vel_x,
+                arg_min(vel_y,      timestamp)   AS vel_y,
+                arg_min(accel_x,    timestamp)   AS accel_x,
+                arg_min(accel_y,    timestamp)   AS accel_y,
+                arg_min(class_label,timestamp)   AS class_label
+            FROM vehicle_trajectories
+            WHERE track_id = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            GROUP BY time_bucket
+            ORDER BY time_bucket
+        """
+        df = self.conn.execute(query, (track_id, start_time, end_time)).df()
+        if df.empty:
+            return []
+
+        df["speed_ms"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        accel_mag = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
+        dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
+        df["signed_accel_ms2"] = accel_mag.where(dot >= 0, -accel_mag)
+
+        result = []
+        for _, row in df.iterrows():
+            lm, dist = self.nearest_landmark(float(row["pos_x"]), float(row["pos_y"]))
+            result.append({
+                "time_bucket":              round(float(row["time_bucket"]), 3),
+                "timestamp":                round(float(row["timestamp"]), 3),
+                "track_id":                 track_id,
+                "class_label":              row["class_label"],
+                "pos_x":                    round(float(row["pos_x"]), 3),
+                "pos_y":                    round(float(row["pos_y"]), 3),
+                "vel_x":                    round(float(row["vel_x"]), 3),
+                "vel_y":                    round(float(row["vel_y"]), 3),
+                "accel_x":                  round(float(row["accel_x"]), 3),
+                "accel_y":                  round(float(row["accel_y"]), 3),
+                "speed_ms":                 round(float(row["speed_ms"]), 3),
+                "signed_accel_ms2":         round(float(row["signed_accel_ms2"]), 3),
+                "nearest_landmark":         lm,
+                "distance_to_landmark_m":   dist,
+            })
+        return result
+
+    def get_all_vehicles_sampled(
+        self,
+        interval_secs: float = 0.5,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> List[dict]:
+        """
+        Returns one data snapshot per (vehicle, time bucket) for all vehicles.
+
+        Same bucketing logic as ``get_sampled_trajectory`` but covers every
+        track_id present in the given time window in a single SQL query.
+
+        Useful for:
+        - Building a time-series table for a dashboa or export (CSV/Excel).
+        - Comparing all vehicles' positions at the same timestamps.
+        - Feeding a downstream ML pipeline that expects fixed-rate inputs.
+
+        Args:
+            interval_secs: Bucket width in seconds (default 0.5 s).
+            start_time:    Start of the query window (seconds).
+            end_time:      End of the query window (seconds).
+
+        Returns:
+            Flat list of dicts sorted by (time_bucket, track_id).
+            Each dict has the same keys as ``get_sampled_trajectory`` rows.
+        """
+        interval_secs = float(interval_secs)
+        if not (0.05 <= interval_secs <= 3600.0):
+            raise ValueError(f"interval_secs must be between 0.05 and 3600, got {interval_secs}")
+
+        self._flush()
+
+        iv = interval_secs
+        query = f"""
+            SELECT
+                track_id,
+                FLOOR(timestamp / {iv}) * {iv}  AS time_bucket,
+                arg_min(timestamp,  timestamp)   AS timestamp,
+                arg_min(pos_x,      timestamp)   AS pos_x,
+                arg_min(pos_y,      timestamp)   AS pos_y,
+                arg_min(vel_x,      timestamp)   AS vel_x,
+                arg_min(vel_y,      timestamp)   AS vel_y,
+                arg_min(accel_x,    timestamp)   AS accel_x,
+                arg_min(accel_y,    timestamp)   AS accel_y,
+                arg_min(class_label,timestamp)   AS class_label
+            FROM vehicle_trajectories
+            WHERE timestamp >= ?
+              AND timestamp <= ?
+            GROUP BY track_id, time_bucket
+            ORDER BY time_bucket, track_id
+        """
+        df = self.conn.execute(query, (start_time, end_time)).df()
+        if df.empty:
+            return []
+
+        df["speed_ms"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        accel_mag = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
+        dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
+        df["signed_accel_ms2"] = accel_mag.where(dot >= 0, -accel_mag)
+
+        result = []
+        for _, row in df.iterrows():
+            lm, dist = self.nearest_landmark(float(row["pos_x"]), float(row["pos_y"]))
+            result.append({
+                "time_bucket":              round(float(row["time_bucket"]), 3),
+                "timestamp":                round(float(row["timestamp"]), 3),
+                "track_id":                 int(row["track_id"]),
+                "class_label":              row["class_label"],
+                "pos_x":                    round(float(row["pos_x"]), 3),
+                "pos_y":                    round(float(row["pos_y"]), 3),
+                "vel_x":                    round(float(row["vel_x"]), 3),
+                "vel_y":                    round(float(row["vel_y"]), 3),
+                "accel_x":                  round(float(row["accel_x"]), 3),
+                "accel_y":                  round(float(row["accel_y"]), 3),
+                "speed_ms":                 round(float(row["speed_ms"]), 3),
+                "signed_accel_ms2":         round(float(row["signed_accel_ms2"]), 3),
+                "nearest_landmark":         lm,
+                "distance_to_landmark_m":   dist,
+            })
+        return result
+
+    # ------------------------------------------------------------------
+    # Time-to-Collision (TTC) analysis
+    # ------------------------------------------------------------------
+
+    def compute_ttc(
+        self,
+        track_id_a: int,
+        track_id_b: int,
+        start_time: float,
+        end_time: float,
+    ) -> dict:
+        """
+        Computes Time-to-Collision (TTC) between two vehicles across a window.
+
+        TTC = gap / closing_speed, where:
+          gap           = centre_distance - half_length_A - half_length_B  (metres)
+          closing_speed = dot(relative_velocity_A_minus_B, unit_vector_A_to_B)
+
+        TTC is only defined when closing_speed > 0 (vehicles approaching).
+        When vehicles are diverging (closing_speed ≤ 0) TTC = infinity.
+
+        Standard conflict thresholds (SSAM / HCM):
+          TTC < 1.5 s  → critical conflict
+          TTC < 3.0 s  → serious conflict
+
+        Returns:
+            Dict with min_ttc_s, conflict_level, timestamp_s, gap_at_min_ttc_m,
+            closing_speed_ms, vehicle_a/b_pos, and a sampled ttc_series list.
+            On missing data: {"error": "..."}.
+        """
+        import pandas as pd
+        self._flush()
+        df_a = self.get_trajectory_window(start_time, end_time, track_id_a)
+        df_b = self.get_trajectory_window(start_time, end_time, track_id_b)
+        if df_a.empty or df_b.empty:
+            return {
+                "error": (
+                    f"No data for one or both vehicles (ids={track_id_a},{track_id_b}) "
+                    f"in t={start_time}-{end_time}s."
+                )
+            }
+
+        half_a = self._half_length(track_id_a, start_time, end_time)
+        half_b = self._half_length(track_id_b, start_time, end_time)
+
+        df_a = df_a.sort_values("timestamp").reset_index(drop=True)
+        df_b = df_b.sort_values("timestamp").reset_index(drop=True)
+        merged = pd.merge_asof(
+            df_a, df_b, on="timestamp",
+            suffixes=("_a", "_b"), direction="nearest",
+        )
+
+        dx = merged["pos_x_b"] - merged["pos_x_a"]
+        dy = merged["pos_y_b"] - merged["pos_y_a"]
+        centre_dist = (dx ** 2 + dy ** 2) ** 0.5
+        # Unit vector from A to B (avoid divide-by-zero at coincident positions)
+        eps = 1e-6
+        ux = dx / (centre_dist + eps)
+        uy = dy / (centre_dist + eps)
+
+        rel_vx = merged["vel_x_a"] - merged["vel_x_b"]
+        rel_vy = merged["vel_y_a"] - merged["vel_y_b"]
+        closing_speed = rel_vx * ux + rel_vy * uy   # positive = approaching
+
+        gap = centre_dist - half_a - half_b
+        # TTC only defined for approaching pairs with positive gap
+        ttc = gap / closing_speed.clip(lower=eps)
+        ttc = ttc.where((closing_speed > 0) & (gap > 0), other=float("inf"))
+        merged["ttc_s"] = ttc
+        merged["gap_m"] = gap
+        merged["closing_speed_ms"] = closing_speed
+
+        finite_mask = merged["ttc_s"] < 1e8
+        if not finite_mask.any():
+            return {
+                "track_id_a": track_id_a,
+                "track_id_b": track_id_b,
+                "time_window": f"{start_time}-{end_time}",
+                "min_ttc_s": None,
+                "conflict_level": "NONE",
+                "note": "Vehicles were never approaching each other in this window.",
+            }
+
+        min_idx = merged.loc[finite_mask, "ttc_s"].idxmin()
+        min_row = merged.loc[min_idx]
+        min_ttc = float(min_row["ttc_s"])
+
+        if min_ttc < 1.5:
+            conflict = "CRITICAL"
+        elif min_ttc < 3.0:
+            conflict = "SERIOUS"
+        else:
+            conflict = "LOW"
+
+        # Sample up to 20 points from the TTC series for the agent
+        sample_step = max(1, len(merged) // 20)
+        series = []
+        for _, row in merged.iloc[::sample_step].iterrows():
+            series.append({
+                "timestamp": round(float(row["timestamp"]), 2),
+                "ttc_s": round(float(row["ttc_s"]), 2) if row["ttc_s"] < 1e8 else None,
+                "gap_m": round(float(row["gap_m"]), 2),
+                "closing_speed_ms": round(float(row["closing_speed_ms"]), 2),
+            })
+
+        return {
+            "track_id_a": track_id_a,
+            "track_id_b": track_id_b,
+            "time_window": f"{start_time}-{end_time}",
+            "min_ttc_s": round(min_ttc, 2),
+            "conflict_level": conflict,
+            "timestamp_of_min_ttc_s": round(float(min_row["timestamp"]), 2),
+            "gap_at_min_ttc_m": round(float(min_row["gap_m"]), 2),
+            "closing_speed_ms": round(float(min_row["closing_speed_ms"]), 2),
+            "vehicle_a_pos": {
+                "x": round(float(min_row["pos_x_a"]), 2),
+                "y": round(float(min_row["pos_y_a"]), 2),
+            },
+            "vehicle_b_pos": {
+                "x": round(float(min_row["pos_x_b"]), 2),
+                "y": round(float(min_row["pos_y_b"]), 2),
+            },
+            "ttc_series": series,
+        }
+
+    # ------------------------------------------------------------------
+    # Speed statistics (85th percentile, mean, max)
+    # ------------------------------------------------------------------
+
+    def get_speed_statistics(
+        self,
+        track_id: int = -1,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> List[dict]:
+        """
+        Computes speed statistics including the 85th percentile speed.
+
+        The 85th percentile speed (V85) is the standard design speed metric
+        used in road safety audits and speed limit policy — it represents the
+        speed below which 85% of vehicles travel.
+
+        Args:
+            track_id:   -1 = all vehicles (one row per vehicle);
+                        ≥ 0 = single vehicle.
+            start_time: Window start (seconds).
+            end_time:   Window end (seconds).
+
+        Returns:
+            List of dicts per vehicle: track_id, class_label,
+            v85_speed_kmh, mean_speed_kmh, max_speed_kmh, data_points.
+        """
+        self._flush()
+        track_filter = "" if track_id < 0 else f"AND track_id = {int(track_id)}"
+        query = f"""
+            WITH speeds AS (
+                SELECT
+                    track_id,
+                    MIN(class_label) AS class_label,
+                    SQRT(vel_x * vel_x + vel_y * vel_y) AS speed_ms
+                FROM vehicle_trajectories
+                WHERE timestamp >= ? AND timestamp <= ?
+                  {track_filter}
+            )
+            SELECT
+                track_id,
+                MIN(class_label) AS class_label,
+                PERCENTILE_CONT(0.85) WITHIN GROUP (ORDER BY speed_ms) AS v85_ms,
+                AVG(speed_ms)  AS mean_ms,
+                MAX(speed_ms)  AS max_ms,
+                COUNT(*)       AS data_points
+            FROM speeds
+            GROUP BY track_id
+            ORDER BY v85_ms DESC
+        """
+        df = self.conn.execute(query, (start_time, end_time)).df()
+        if df.empty:
+            return []
+
+        result = []
+        for _, row in df.iterrows():
+            result.append({
+                "track_id":       int(row["track_id"]),
+                "class_label":    row["class_label"],
+                "v85_speed_kmh":  round(float(row["v85_ms"]) * 3.6, 1),
+                "mean_speed_kmh": round(float(row["mean_ms"]) * 3.6, 1),
+                "max_speed_kmh":  round(float(row["max_ms"]) * 3.6, 1),
+                "data_points":    int(row["data_points"]),
+            })
+        return result
+
+    # ------------------------------------------------------------------
+    # Vehicle count by time period
+    # ------------------------------------------------------------------
+
+    def get_vehicle_count_by_period(
+        self,
+        period_secs: float = 3600.0,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> List[dict]:
+        """
+        Counts distinct vehicles observed per fixed time period.
+
+        Used for flow rate analysis: how many vehicles pass per hour/minute.
+        Also computes Peak Hour Factor (PHF) = total_count / (4 × peak_15min_count)
+        when period_secs = 900 (15 minutes).
+
+        Args:
+            period_secs: Bucket width in seconds (default 3600 = 1 hour).
+            start_time:  Window start (seconds).
+            end_time:    Window end (seconds).
+
+        Returns:
+            List of dicts: period_start_s, period_end_s, vehicle_count,
+            vehicles_per_hour (flow rate normalised to hourly).
+        """
+        self._flush()
+        pf = float(period_secs)
+        query = f"""
+            SELECT
+                FLOOR(timestamp / {pf}) * {pf}  AS period_start,
+                COUNT(DISTINCT track_id)          AS vehicle_count
+            FROM vehicle_trajectories
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY period_start
+            ORDER BY period_start
+        """
+        df = self.conn.execute(query, (start_time, end_time)).df()
+        if df.empty:
+            return []
+
+        hourly_factor = 3600.0 / pf
+        result = []
+        for _, row in df.iterrows():
+            ps = float(row["period_start"])
+            cnt = int(row["vehicle_count"])
+            result.append({
+                "period_start_s":    round(ps, 1),
+                "period_end_s":      round(ps + pf, 1),
+                "vehicle_count":     cnt,
+                "vehicles_per_hour": round(cnt * hourly_factor, 1),
+            })
+        return result
+
+    # ------------------------------------------------------------------
+    # Queue / congestion detection
+    # ------------------------------------------------------------------
+
+    def detect_queues(
+        self,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+        min_vehicles: int = 3,
+        max_speed_ms: float = 1.0,
+        period_secs: float = 2.0,
+    ) -> List[dict]:
+        """
+        Detects congestion / queue events — time windows where ≥ N vehicles
+        are simultaneously near-stationary (speed < max_speed_ms).
+
+        Algorithm:
+          1. Bucket timestamps into period_secs intervals.
+          2. For each bucket, count distinct vehicles with speed < max_speed_ms.
+          3. Merge adjacent buckets into continuous queue episodes.
+          4. Return episodes with ≥ min_vehicles slow vehicles.
+
+        This is a macroscopic shockwave detector: it flags when a queue has
+        formed but does not yet pinpoint its spatial extent (use
+        get_vehicle_data_at_interval for spatial positions at those timestamps).
+
+        Args:
+            start_time:    Window start (seconds).
+            end_time:      Window end (seconds).
+            min_vehicles:  Minimum simultaneous slow vehicles to flag.
+            max_speed_ms:  Speed threshold below which a vehicle is "queued".
+            period_secs:   Time bucket width for aggregation.
+
+        Returns:
+            List of queue episode dicts: start_s, end_s, duration_s,
+            peak_slow_vehicle_count, mean_slow_vehicle_count.
+        """
+        self._flush()
+        pf = float(period_secs)
+        spd_sq = max_speed_ms ** 2
+
+        query = f"""
+            SELECT
+                FLOOR(timestamp / {pf}) * {pf} AS bucket,
+                COUNT(DISTINCT track_id)         AS slow_count
+            FROM vehicle_trajectories
+            WHERE timestamp >= ?
+              AND timestamp <= ?
+              AND (vel_x * vel_x + vel_y * vel_y) < {spd_sq}
+            GROUP BY bucket
+            HAVING slow_count >= ?
+            ORDER BY bucket
+        """
+        df = self.conn.execute(query, (start_time, end_time, min_vehicles)).df()
+        if df.empty:
+            return []
+
+        # Merge adjacent buckets (gap ≤ 1 bucket apart) into episodes
+        episodes = []
+        ep_start = ep_end = float(df.iloc[0]["bucket"])
+        peak = mean_acc = int(df.iloc[0]["slow_count"])
+        count_in_ep = 1
+
+        for _, row in df.iloc[1:].iterrows():
+            bucket = float(row["bucket"])
+            slow = int(row["slow_count"])
+            if bucket - ep_end <= pf * 1.5:  # contiguous
+                ep_end = bucket
+                peak = max(peak, slow)
+                mean_acc += slow
+                count_in_ep += 1
+            else:
+                episodes.append({
+                    "start_s":                  round(ep_start, 1),
+                    "end_s":                    round(ep_end + pf, 1),
+                    "duration_s":               round(ep_end + pf - ep_start, 1),
+                    "peak_slow_vehicle_count":  peak,
+                    "mean_slow_vehicle_count":  round(mean_acc / count_in_ep, 1),
+                })
+                ep_start = ep_end = bucket
+                peak = mean_acc = slow
+                count_in_ep = 1
+
+        episodes.append({
+            "start_s":                  round(ep_start, 1),
+            "end_s":                    round(ep_end + pf, 1),
+            "duration_s":               round(ep_end + pf - ep_start, 1),
+            "peak_slow_vehicle_count":  peak,
+            "mean_slow_vehicle_count":  round(mean_acc / count_in_ep, 1),
+        })
+        return episodes
+
+    # ------------------------------------------------------------------
+    # Turning Movement Count (TMC)
+    # ------------------------------------------------------------------
+
+    def get_turning_movement_counts(
+        self,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> List[dict]:
+        """
+        Computes a Turning Movement Count (TMC) matrix from zone gate crossings.
+
+        Each vehicle's first confirmed/estimated entry gate is its approach arm;
+        its last exit gate is its departure arm.  The (entry, exit) pair is the
+        turn movement (e.g. North→South = through, North→East = right turn).
+
+        Vehicle class is joined from vehicle_trajectories so counts are broken
+        down by vehicle type (car, truck, motorcycle, etc.).
+
+        Args:
+            start_time: Window start (seconds).
+            end_time:   Window end (seconds).
+
+        Returns:
+            List of dicts: origin_gate, destination_gate, class_label,
+            vehicle_count, sorted by count descending.
+        """
+        self._flush()
+        query = """
+            WITH entries AS (
+                SELECT
+                    track_id,
+                    gate_name  AS origin_gate,
+                    MIN(timestamp) AS entry_time
+                FROM zone_crossings
+                WHERE direction = 'enter'
+                  AND timestamp >= ? AND timestamp <= ?
+                GROUP BY track_id, gate_name
+            ),
+            exits AS (
+                SELECT
+                    track_id,
+                    gate_name  AS dest_gate,
+                    MAX(timestamp) AS exit_time
+                FROM zone_crossings
+                WHERE direction = 'exit'
+                  AND timestamp >= ? AND timestamp <= ?
+                GROUP BY track_id, gate_name
+            ),
+            classes AS (
+                SELECT track_id, MIN(class_label) AS class_label
+                FROM vehicle_trajectories
+                WHERE timestamp >= ? AND timestamp <= ?
+                GROUP BY track_id
+            )
+            SELECT
+                e.origin_gate,
+                x.dest_gate,
+                COALESCE(c.class_label, 'unknown') AS class_label,
+                COUNT(*)                            AS vehicle_count
+            FROM entries e
+            JOIN exits    x ON e.track_id = x.track_id
+            LEFT JOIN classes c ON e.track_id = c.track_id
+            GROUP BY e.origin_gate, x.dest_gate, c.class_label
+            ORDER BY vehicle_count DESC
+        """
+        df = self.conn.execute(
+            query,
+            (start_time, end_time, start_time, end_time, start_time, end_time),
+        ).df()
+        if df.empty:
+            return []
+        return df.to_dict(orient="records")
+
     def close(self) -> None:
         """Flushes any remaining buffered rows and closes the database connection."""
         self._flush()

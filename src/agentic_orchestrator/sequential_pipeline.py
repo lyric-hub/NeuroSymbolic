@@ -64,6 +64,12 @@ from .tools import (
     get_vehicle_trajectory,
     get_vehicle_proximity,
     compare_vehicle_kinematics,
+    get_vehicle_data_at_interval,
+    compute_ttc,
+    get_speed_statistics,
+    get_vehicle_count_report,
+    detect_traffic_queue,
+    get_turning_movement_counts,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,6 +87,12 @@ TOOLS_FULL = [
     get_vehicle_trajectory,        # Full spatial path reconstruction per vehicle
     get_vehicle_proximity,         # Min distance between two vehicles in a window
     compare_vehicle_kinematics,    # Side-by-side stats for multiple vehicles
+    get_vehicle_data_at_interval,  # Fixed-rate snapshots (e.g. every 0.5 s)
+    compute_ttc,                   # Time-to-Collision (TTC) conflict metric
+    get_speed_statistics,          # 85th-percentile speed (V85) + mean + max
+    get_vehicle_count_report,      # Volume / flow rate per time period
+    detect_traffic_queue,          # Queue / congestion episode detection
+    get_turning_movement_counts,   # Gate-level TMC matrix
 ]
 TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
@@ -142,6 +154,32 @@ Available tools:
                                  Pass track_ids_csv e.g. "4,9" to get stats for both simultaneously.
                                  Use instead of calling verify_physics_math twice for incident comparisons.
 
+11. compute_ttc               — Time-to-Collision (TTC) between two vehicles.
+                                 TTC = gap / closing_speed. Only defined when vehicles are approaching.
+                                 Conflict levels: CRITICAL < 1.5 s, SERIOUS < 3.0 s, LOW ≥ 3.0 s.
+                                 Use AFTER get_vehicle_proximity confirms vehicles were close.
+                                 Returns min_ttc_s, conflict_level, gap_at_min_ttc_m, closing_speed_ms.
+
+12. get_speed_statistics      — 85th-percentile speed (V85), mean, and max speed.
+                                 V85 is the standard road safety / speed limit review metric.
+                                 Use for: "what is the 85th percentile speed?", "are vehicles speeding?"
+                                 Pass track_id=-1 for all vehicles, ≥0 for a specific vehicle.
+
+13. get_vehicle_count_report  — Vehicle count and flow rate per time period.
+                                 Use for: "how many vehicles per hour?", "when was peak traffic?"
+                                 Use period_secs=900 for 15-min buckets (PHF analysis).
+                                 Returns vehicles_per_hour for each bucket.
+
+14. detect_traffic_queue      — Queue / congestion episode detection.
+                                 Finds time windows where ≥ N vehicles are simultaneously near-stationary.
+                                 Use for: "was there a queue?", "how long did congestion last?"
+                                 After finding episodes, use get_vehicle_data_at_interval for positions.
+
+15. get_turning_movement_counts — Gate-level TMC matrix.
+                                 Pairs entry gate with exit gate per vehicle to produce turn counts.
+                                 Use for: "how many vehicles turned left from North?", "what is the
+                                 dominant movement?" Requires zone_config.json with named gates.
+
 Decision rules:
 - Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
 - Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5.
@@ -150,6 +188,11 @@ Decision rules:
 - Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
 - Flow/count/OD questions: tool 6 directly.
 - Vehicle-type questions ("behaviour of motorcycles"): tool 7 → tools 4 + 5 per track_id.
+- TTC / conflict severity: tool 8 (proximity) → tool 11 (TTC) for full conflict picture.
+- Speed compliance / V85: tool 12 for all vehicles, then tool 5 per flagged vehicle.
+- Traffic volume / peak hour: tool 13 directly.
+- Queue / congestion: tool 14 to find episodes, then tool 10 for vehicle positions inside.
+- Turning movements / intersection flow: tool 15 directly.
 - Always cite the tool output that supports each claim in your final answer.
 - Base your final answer strictly on what the tools returned. Do not invent facts."""
 
@@ -243,6 +286,64 @@ _PLAN_TEMPLATES = {
         ],
         "plan": (
             "1. Call query_zone_flow to get gate counts and OD pairs."
+        ),
+    },
+    "speed_compliance": {
+        "keywords": [
+            "85th", "v85", "percentile", "speed limit", "compliance",
+            "average speed", "mean speed", "typical speed",
+        ],
+        "plan": (
+            "1. Call get_speed_statistics (track_id=-1) to get V85, mean, max for all vehicles.\n"
+            "2. Call evaluate_traffic_rules for vehicles whose max speed exceeds the posted limit.\n"
+            "3. Summarise compliance: percentage of vehicles within limit, V85 vs posted limit."
+        ),
+    },
+    "volume": {
+        "keywords": [
+            "volume", "how many", "count per", "per hour", "per minute",
+            "peak hour", "traffic count", "phf", "aadt",
+        ],
+        "plan": (
+            "1. Call get_vehicle_count_report with period_secs=900 (15-min buckets) for PHF.\n"
+            "2. Call get_vehicle_count_report with period_secs=3600 for hourly volumes.\n"
+            "3. Identify peak period and compute PHF = total_peak_hour / (4 × peak_15min)."
+        ),
+    },
+    "queue": {
+        "keywords": [
+            "queue", "congestion", "traffic jam", "backup", "shockwave",
+            "stationary", "slow traffic", "gridlock",
+        ],
+        "plan": (
+            "1. Call detect_traffic_queue to find congestion episodes.\n"
+            "2. For each episode, call get_vehicle_data_at_interval at the episode start/end\n"
+            "   to get vehicle positions and identify the queue's spatial extent.\n"
+            "3. Call get_vehicle_count_report to correlate queue episodes with traffic volume."
+        ),
+    },
+    "turning_movements": {
+        "keywords": [
+            "turning", "turn", "left turn", "right turn", "through", "u-turn",
+            "tmc", "approach", "departure", "intersection movement",
+        ],
+        "plan": (
+            "1. Call get_turning_movement_counts to get the full TMC matrix.\n"
+            "2. Identify dominant movements and any unexpected movements (e.g. U-turns).\n"
+            "3. Call query_zone_flow for dwell times and gate counts to supplement TMC."
+        ),
+    },
+    "conflict": {
+        "keywords": [
+            "ttc", "time to collision", "conflict", "close call",
+            "how close", "dangerous gap", "separation",
+        ],
+        "plan": (
+            "1. Call search_semantic_events to find the conflict event and time window.\n"
+            "2. Call query_graph_relationships to identify the two involved vehicles.\n"
+            "3. Call get_vehicle_proximity to confirm minimum gap and whether collision occurred.\n"
+            "4. Call compute_ttc for the same vehicles and window to get conflict severity level.\n"
+            "5. Synthesise: gap + TTC together give the full conflict picture."
         ),
     },
 }

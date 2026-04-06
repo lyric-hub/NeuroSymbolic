@@ -1,18 +1,24 @@
 """
 LangGraph Agent Tools — Neuro-Symbolic Bridge
 ==============================================
-Nine LangChain tools that expose the hybrid memory layer to the ReAct agent.
+Fifteen LangChain tools that expose the hybrid memory layer to the ReAct agent.
 Each tool maps to a distinct reasoning modality:
 
   search_semantic_events      → Milvus ANN search (event-level)      (neural)
   search_entity_profiles      → Milvus ANN search (vehicle-level)    (neural)
   query_graph_relationships   → Kùzu Cypher traversal                (symbolic)
   verify_physics_math         → DuckDB kinematic stats + landmark     (symbolic)
-  evaluate_traffic_rules      → Rule Engine                          (symbolic / deterministic)
+  evaluate_traffic_rules      → Rule Engine (auto zone config)       (symbolic / deterministic)
   query_zone_flow             → DuckDB OD analysis                   (symbolic)
   get_vehicle_trajectory      → DuckDB spatial path reconstruction   (symbolic)
   get_vehicle_proximity       → DuckDB min-distance between vehicles (symbolic)
   compare_vehicle_kinematics  → DuckDB multi-vehicle stats           (symbolic)
+  get_vehicle_data_at_interval→ DuckDB interval-based snapshots      (symbolic)
+  compute_ttc                 → Time-to-Collision analysis            (symbolic)
+  get_speed_statistics        → 85th-percentile + mean + max speed   (symbolic)
+  get_vehicle_count_report    → Flow rate / volume per time period   (symbolic)
+  detect_traffic_queue        → Queue / congestion episode detection  (symbolic)
+  get_turning_movement_counts → Gate-level TMC matrix                (symbolic)
 
 Tools are lazy-initialised: DB connections open on first use, not at
 import time, so the FastAPI server starts cleanly even when a DB is not
@@ -314,9 +320,12 @@ def evaluate_traffic_rules(
     making findings fully citable.
 
     Rules evaluated:
-      SPEEDING               — peak speed > 50 km/h (13.89 m/s)
+      SPEEDING               — speed > posted zone limit (default 50 km/h)
       HARD_BRAKING           — signed deceleration < −4.0 m/s²
       AGGRESSIVE_ACCELERATION — acceleration magnitude > 3.5 m/s²
+      STATIONARY_IN_LANE     — stopped < 0.5 m/s for > 10 s in live lane
+      WRONG_WAY              — heading > 90° from zone flow_direction_deg
+                               (only fires when zone_config.json sets flow_direction_deg)
 
     Args:
         track_id:   Integer vehicle ID (e.g. 4 for 'Vehicle 4').
@@ -335,8 +344,24 @@ def evaluate_traffic_rules(
             f"in t={start_time}–{end_time}s."
         )
 
+    # Auto-load per-zone thresholds from zone_config.json if it exists.
+    # Enables school zones (30 km/h), motorways (130 km/h), etc. automatically.
+    speed_limit_ms = None
+    flow_direction_deg = None
+    try:
+        from src.physics_engine.zone_manager import ZoneConfig as _ZC
+        zc = _ZC.from_json("zone_config.json")
+        speed_limit_ms = zc.speed_limit_kmh / 3.6
+        flow_direction_deg = zc.flow_direction_deg
+    except Exception:
+        pass  # no zone config or malformed — fall back to global defaults
+
     engine = TrafficRuleEngine()
-    violations = engine.evaluate(df, track_id)
+    violations = engine.evaluate(
+        df, track_id,
+        speed_limit_ms=speed_limit_ms,
+        flow_direction_deg=flow_direction_deg,
+    )
 
     if not violations:
         return json.dumps({
@@ -529,3 +554,345 @@ def compare_vehicle_kinematics(
         })
 
     return json.dumps(results, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 10 — Interval-based data snapshots (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_vehicle_data_at_interval(
+    interval_secs: float,
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+    track_id: int = -1,
+) -> str:
+    """
+    Interval-Based Data Snapshots — one row per vehicle per time bucket.
+
+    Returns kinematic data sampled at a fixed time interval instead of
+    every raw frame.  Useful when the user needs data at a specific rate,
+    e.g. "give me data every 0.5 seconds" or "show me where each vehicle
+    was every second".
+
+    For each bucket the tool picks the **first** measured sample that falls
+    inside it (deterministic — no averaging or interpolation), enriched with:
+      speed_ms, signed_accel_ms2, nearest_landmark, distance_to_landmark_m.
+
+    Args:
+        interval_secs: Sampling interval in seconds (e.g. 0.5, 1.0, 2.0).
+                       Minimum 0.05 s, maximum 3600 s.
+        start_time:    Window start in seconds (default: 0.0).
+        end_time:      Window end in seconds (default: end of video).
+        track_id:      Specific vehicle ID to query, or -1 (default) to
+                       return data for ALL vehicles in the window.
+
+    Returns JSON list of snapshot rows.  Each row:
+        time_bucket, timestamp, track_id, class_label,
+        pos_x, pos_y, speed_ms, signed_accel_ms2,
+        nearest_landmark, distance_to_landmark_m.
+    """
+    log.info(
+        "Tool: get_vehicle_data_at_interval | interval=%.2fs, vehicle=%s, t=%.1f-%.1f",
+        interval_secs, track_id if track_id >= 0 else "ALL", start_time, end_time,
+    )
+    db = _get_duckdb()
+    try:
+        if track_id >= 0:
+            rows = db.get_sampled_trajectory(track_id, interval_secs, start_time, end_time)
+        else:
+            rows = db.get_all_vehicles_sampled(interval_secs, start_time, end_time)
+    except ValueError as exc:
+        return f"Invalid interval: {exc}"
+
+    if not rows:
+        scope = f"Vehicle {track_id}" if track_id >= 0 else "any vehicle"
+        return (
+            f"No data found for {scope} in t={start_time}–{end_time}s. "
+            "Ensure the video has been processed."
+        )
+
+    return json.dumps({
+        "interval_secs": interval_secs,
+        "time_window": f"{start_time}-{end_time}",
+        "vehicle_filter": track_id if track_id >= 0 else "all",
+        "row_count": len(rows),
+        "data": rows,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11 — Time-to-Collision (TTC) analysis (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def compute_ttc(
+    track_id_a: int,
+    track_id_b: int,
+    start_time: float,
+    end_time: float,
+) -> str:
+    """
+    Time-to-Collision (TTC) Analysis — industry-standard traffic conflict metric.
+
+    TTC = gap / closing_speed.
+    Only defined when two vehicles are approaching (closing_speed > 0).
+    When vehicles are diverging, TTC = infinity (no conflict).
+
+    Conflict severity thresholds (SSAM / Highway Capacity Manual):
+      TTC < 1.5 s  → CRITICAL conflict (imminent crash risk)
+      TTC < 3.0 s  → SERIOUS conflict  (significant safety hazard)
+      TTC ≥ 3.0 s  → LOW (acceptable gap)
+
+    Use this tool to quantify how close two vehicles came to a collision —
+    complementing get_vehicle_proximity (which gives minimum gap) by also
+    accounting for relative speed and approach trajectory.
+
+    Use AFTER get_vehicle_proximity confirms vehicles were close, to determine
+    whether the situation was actually dangerous (fast approach) or benign
+    (slow crawl at close range).
+
+    Args:
+        track_id_a:  First vehicle (typically the following vehicle).
+        track_id_b:  Second vehicle (typically the lead vehicle).
+        start_time:  Window start in seconds.
+        end_time:    Window end in seconds.
+
+    Returns JSON with: min_ttc_s, conflict_level, timestamp_of_min_ttc_s,
+    gap_at_min_ttc_m, closing_speed_ms, vehicle_a/b_pos, ttc_series.
+    """
+    log.info(
+        "Tool: compute_ttc | vehicles=%d,%d, t=%.1f-%.1f",
+        track_id_a, track_id_b, start_time, end_time,
+    )
+    result = _get_duckdb().compute_ttc(track_id_a, track_id_b, start_time, end_time)
+
+    if "error" in result:
+        return result["error"]
+
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 12 — Speed statistics / 85th percentile speed (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_speed_statistics(
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+    track_id: int = -1,
+) -> str:
+    """
+    Speed Statistics — 85th percentile (V85), mean, and maximum speed per vehicle.
+
+    The 85th percentile speed (V85) is the key design speed metric used in road
+    safety audits and speed limit review.  It represents the speed below which
+    85% of vehicles travel — if V85 exceeds the posted limit, the limit may need
+    enforcement or re-assessment.
+
+    Use to answer:
+      - "What is the 85th percentile speed on this road section?"
+      - "Are vehicles generally complying with the speed limit?"
+      - "Which vehicle class drives fastest on average?"
+
+    Args:
+        start_time: Window start in seconds (default: full video).
+        end_time:   Window end in seconds (default: full video).
+        track_id:   Specific vehicle ID, or -1 (default) for all vehicles.
+
+    Returns JSON list per vehicle with:
+        track_id, class_label, v85_speed_kmh, mean_speed_kmh, max_speed_kmh,
+        data_points.
+    """
+    log.info(
+        "Tool: get_speed_statistics | vehicle=%s, t=%.1f-%.1f",
+        track_id if track_id >= 0 else "ALL", start_time, end_time,
+    )
+    rows = _get_duckdb().get_speed_statistics(track_id, start_time, end_time)
+
+    if not rows:
+        return (
+            "No speed data found. "
+            "Ensure the video has been processed."
+        )
+
+    return json.dumps({
+        "time_window": f"{start_time}-{end_time}",
+        "vehicle_filter": track_id if track_id >= 0 else "all",
+        "vehicle_count": len(rows),
+        "statistics": rows,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 13 — Vehicle count / flow rate by time period (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_vehicle_count_report(
+    period_secs: float = 3600.0,
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+) -> str:
+    """
+    Vehicle Count and Flow Rate Report — vehicles observed per time period.
+
+    Counts distinct vehicles detected in each fixed-width time bucket and
+    normalises to vehicles-per-hour (flow rate).  Essential for:
+      - Volume studies (AADT estimation)
+      - Peak Hour Factor (PHF) analysis — use period_secs=900 (15-min buckets)
+      - Identifying congestion onset times
+
+    PHF = total_peak_hour_count / (4 × peak_15min_count).
+    PHF close to 1.0 means steady flow; low PHF means heavy bursts.
+
+    Args:
+        period_secs: Bucket width in seconds.
+                     Common values: 60 (per minute), 900 (15-min for PHF),
+                     3600 (hourly, default).
+        start_time:  Window start in seconds (default: full video).
+        end_time:    Window end in seconds (default: full video).
+
+    Returns JSON list of time periods with:
+        period_start_s, period_end_s, vehicle_count, vehicles_per_hour.
+    """
+    log.info(
+        "Tool: get_vehicle_count_report | period=%.0fs, t=%.1f-%.1f",
+        period_secs, start_time, end_time,
+    )
+    rows = _get_duckdb().get_vehicle_count_by_period(period_secs, start_time, end_time)
+
+    if not rows:
+        return "No vehicle data found in the specified window."
+
+    total = sum(r["vehicle_count"] for r in rows)
+    peak = max(rows, key=lambda r: r["vehicle_count"])
+
+    return json.dumps({
+        "period_secs": period_secs,
+        "time_window": f"{start_time}-{end_time}",
+        "total_vehicles": total,
+        "peak_period": peak,
+        "periods": rows,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 14 — Queue / congestion detection (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def detect_traffic_queue(
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+    min_vehicles: int = 3,
+    max_speed_kmh: float = 3.6,
+) -> str:
+    """
+    Traffic Queue / Congestion Detection — finds episodes where ≥ N vehicles
+    are simultaneously near-stationary (speed < threshold).
+
+    Detects shockwave formation (queue back-propagation) and sustained
+    congestion events.  Returns continuous queue episodes with duration
+    and peak slow-vehicle count.
+
+    Use to answer:
+      - "Was there a queue at t=60s?"
+      - "How long did the congestion last?"
+      - "What is the worst congestion episode in the video?"
+
+    After finding a queue episode, use get_vehicle_data_at_interval with the
+    episode start/end times to get vehicle positions inside the queue.
+
+    Args:
+        start_time:     Window start in seconds (default: full video).
+        end_time:       Window end in seconds (default: full video).
+        min_vehicles:   Minimum simultaneous slow vehicles to declare a queue
+                        (default 3).
+        max_speed_kmh:  Speed threshold below which a vehicle is "queued"
+                        (default 3.6 km/h = 1 m/s — nearly stopped).
+
+    Returns JSON list of queue episodes with:
+        start_s, end_s, duration_s,
+        peak_slow_vehicle_count, mean_slow_vehicle_count.
+    """
+    log.info(
+        "Tool: detect_traffic_queue | min_vehicles=%d, max_speed=%.1f km/h, t=%.1f-%.1f",
+        min_vehicles, max_speed_kmh, start_time, end_time,
+    )
+    max_speed_ms = max_speed_kmh / 3.6
+    episodes = _get_duckdb().detect_queues(
+        start_time=start_time,
+        end_time=end_time,
+        min_vehicles=min_vehicles,
+        max_speed_ms=max_speed_ms,
+    )
+
+    if not episodes:
+        return (
+            f"No queue episodes found (≥{min_vehicles} vehicles at < {max_speed_kmh} km/h "
+            f"simultaneously) in t={start_time}–{end_time}s."
+        )
+
+    return json.dumps({
+        "time_window": f"{start_time}-{end_time}",
+        "min_vehicles_threshold": min_vehicles,
+        "max_speed_threshold_kmh": max_speed_kmh,
+        "episode_count": len(episodes),
+        "episodes": episodes,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 15 — Turning Movement Count (TMC) matrix (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_turning_movement_counts(
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+) -> str:
+    """
+    Turning Movement Count (TMC) Matrix — gate-level intersection flow breakdown.
+
+    Pairs each vehicle's entry gate (approach arm) with its exit gate (departure
+    arm) to produce the standard TMC matrix used in:
+      - Intersection capacity analysis (HCM methodology)
+      - Signal timing optimisation
+      - Conflict point identification (left-turn vs through conflicts)
+      - Mode split analysis (trucks vs cars vs motorcycles)
+
+    Gate naming conventions (example for 4-arm intersection):
+      North→South = through movement from North approach
+      North→East  = right turn
+      North→West  = left turn
+      North→North = U-turn
+
+    Requires zone_config.json with named gates.
+
+    Args:
+        start_time: Window start in seconds (default: full video).
+        end_time:   Window end in seconds (default: full video).
+
+    Returns JSON with a TMC matrix list, each row:
+        origin_gate, destination_gate, class_label, vehicle_count.
+    Sorted by vehicle_count descending.
+    """
+    log.info(
+        "Tool: get_turning_movement_counts | t=%.1f-%.1f", start_time, end_time,
+    )
+    rows = _get_duckdb().get_turning_movement_counts(start_time, end_time)
+
+    if not rows:
+        return (
+            "No turning movement data found. "
+            "Ensure zone_config.json defines named gates and the video has been processed."
+        )
+
+    total = sum(r["vehicle_count"] for r in rows)
+    return json.dumps({
+        "time_window": f"{start_time}-{end_time}",
+        "total_movements": total,
+        "tmc_matrix": rows,
+    }, indent=2)

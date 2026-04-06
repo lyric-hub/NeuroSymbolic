@@ -22,18 +22,23 @@ This separation is fundamental to Neuro-Symbolic AI:
 
 Rules
 -----
-SPEEDING                — sustained speed above the urban threshold (50 km/h)
+SPEEDING                — sustained speed above the posted limit (default 50 km/h)
 HARD_BRAKING            — deceleration below −4.0 m/s²
 AGGRESSIVE_ACCELERATION — acceleration magnitude above 3.5 m/s²
+WRONG_WAY               — vehicle heading > 90° from expected flow direction
+STATIONARY_IN_LANE      — vehicle stopped (< 0.5 m/s) for > 10 s in a live lane
 
 Thresholds are module-level constants and can be adjusted to match local
 speed limits or road types without touching any rule logic.
+Per-zone speed limit and flow direction are passed as optional parameters
+to ``evaluate()`` and override the module-level defaults automatically.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 
@@ -42,9 +47,14 @@ import pandas as pd
 # Rule thresholds — all SI units (m/s, m/s²)
 # ---------------------------------------------------------------------------
 
-SPEEDING_THRESHOLD_MS: float = 13.89        # 50 km/h in m/s
+SPEEDING_THRESHOLD_MS: float = 13.89        # 50 km/h in m/s  (overridden per-zone)
 HARD_BRAKING_THRESHOLD: float = -4.0        # m/s²  (negative = deceleration)
 AGGRESSIVE_ACCEL_THRESHOLD: float = 3.5     # m/s²  (magnitude)
+WRONG_WAY_ANGLE_DEG: float = 90.0          # heading must differ > this to fire
+WRONG_WAY_MIN_SPEED_MS: float = 1.0        # ignore stationary/very-slow vehicles
+WRONG_WAY_MIN_DURATION_S: float = 1.0      # require sustained wrong-way before firing
+STATIONARY_MIN_DURATION_S: float = 10.0    # seconds stopped to trigger the rule
+STATIONARY_SPEED_THRESHOLD_MS: float = 0.5 # m/s below which vehicle is "stopped"
 
 
 # ---------------------------------------------------------------------------
@@ -94,14 +104,25 @@ class TrafficRuleEngine:
     inside ``evaluate()``.
     """
 
-    def evaluate(self, df: pd.DataFrame, track_id: int) -> List[RuleViolation]:
+    def evaluate(
+        self,
+        df: pd.DataFrame,
+        track_id: int,
+        speed_limit_ms: Optional[float] = None,
+        flow_direction_deg: Optional[float] = None,
+    ) -> List[RuleViolation]:
         """
         Evaluate all rules against the trajectory DataFrame for one vehicle.
 
         Args:
-            df:       DataFrame from ``DuckDBClient.get_trajectory_window()``.
-                      Required columns: timestamp, vel_x, vel_y, accel_x, accel_y.
-            track_id: The vehicle's integer track identifier.
+            df:                DataFrame from ``DuckDBClient.get_trajectory_window()``.
+                               Required columns: timestamp, vel_x, vel_y, accel_x, accel_y.
+            track_id:          The vehicle's integer track identifier.
+            speed_limit_ms:    Per-zone posted speed limit in m/s.  When provided,
+                               overrides the module-level ``SPEEDING_THRESHOLD_MS``.
+                               Pass ``zone_config.speed_limit_kmh / 3.6``.
+            flow_direction_deg: Expected travel direction (degrees, 0=East 90=North CCW).
+                               When provided, enables the WRONG_WAY rule.
 
         Returns:
             List of RuleViolation instances (empty list if no rules fire).
@@ -113,16 +134,18 @@ class TrafficRuleEngine:
         df = df.copy()
         df["speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
         df["accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
-        # Fix 6: direction-aware signed acceleration — same formula as AlertEngine.
-        # Uses dot(velocity, acceleration) to determine braking vs accelerating,
-        # so the rule fires correctly for vehicles braking at any heading angle.
+        # Direction-aware signed acceleration: dot(velocity, acceleration) determines
+        # braking vs accelerating, so the rule fires correctly at any heading angle.
         _dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
         df["signed_accel"] = df["accel_mag"].where(_dot >= 0, -df["accel_mag"])
 
         violations: List[RuleViolation] = []
-        violations += self._check_speeding(df, track_id)
+        violations += self._check_speeding(df, track_id, speed_limit_ms)
         violations += self._check_hard_braking(df, track_id)
         violations += self._check_aggressive_acceleration(df, track_id)
+        violations += self._check_stationary_in_lane(df, track_id)
+        if flow_direction_deg is not None:
+            violations += self._check_wrong_way(df, track_id, flow_direction_deg)
         return violations
 
     # ------------------------------------------------------------------
@@ -130,9 +153,14 @@ class TrafficRuleEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _check_speeding(df: pd.DataFrame, track_id: int) -> List[RuleViolation]:
-        """SPEEDING — any frame where speed exceeds the urban limit."""
-        over = df[df["speed"] > SPEEDING_THRESHOLD_MS]
+    def _check_speeding(
+        df: pd.DataFrame,
+        track_id: int,
+        speed_limit_ms: Optional[float] = None,
+    ) -> List[RuleViolation]:
+        """SPEEDING — any frame where speed exceeds the posted limit."""
+        threshold = speed_limit_ms if speed_limit_ms is not None else SPEEDING_THRESHOLD_MS
+        over = df[df["speed"] > threshold]
         if over.empty:
             return []
 
@@ -145,7 +173,7 @@ class TrafficRuleEngine:
         return [RuleViolation(
             rule_id="SPEEDING",
             description=(
-                f"Vehicle {track_id} exceeded {SPEEDING_THRESHOLD_MS * 3.6:.0f} km/h — "
+                f"Vehicle {track_id} exceeded {threshold * 3.6:.0f} km/h speed limit — "
                 f"peak {max_speed * 3.6:.1f} km/h"
             ),
             track_id=track_id,
@@ -154,7 +182,7 @@ class TrafficRuleEngine:
             evidence={
                 "max_speed_ms": round(max_speed, 2),
                 "max_speed_kmh": round(max_speed * 3.6, 1),
-                "threshold_kmh": round(SPEEDING_THRESHOLD_MS * 3.6, 0),
+                "speed_limit_kmh": round(threshold * 3.6, 0),
                 "duration_over_limit_s": duration_s,
             },
         )]
@@ -210,5 +238,116 @@ class TrafficRuleEngine:
                 "peak_accel_ms2": round(max_accel, 2),
                 "threshold_ms2": AGGRESSIVE_ACCEL_THRESHOLD,
                 "frames_flagged": int(len(aggressive)),
+            },
+        )]
+
+    @staticmethod
+    def _check_wrong_way(
+        df: pd.DataFrame,
+        track_id: int,
+        flow_direction_deg: float,
+    ) -> List[RuleViolation]:
+        """
+        WRONG_WAY — vehicle heading differs from expected flow direction by > 90°.
+
+        Only applied to moving vehicles (speed > WRONG_WAY_MIN_SPEED_MS) to avoid
+        false positives from noisy headings of near-stationary vehicles.
+        Requires the anomaly to persist for at least WRONG_WAY_MIN_DURATION_S
+        seconds to filter out transient noise (lane changes, U-turns completing).
+        """
+        moving = df[df["speed"] > WRONG_WAY_MIN_SPEED_MS].copy()
+        if moving.empty:
+            return []
+
+        moving["heading_deg"] = moving.apply(
+            lambda r: math.degrees(math.atan2(r["vel_y"], r["vel_x"])) % 360,
+            axis=1,
+        )
+
+        def _angular_diff(heading: float) -> float:
+            d = abs(heading - flow_direction_deg) % 360
+            return min(d, 360.0 - d)
+
+        moving["ang_diff"] = moving["heading_deg"].apply(_angular_diff)
+        wrong = moving[moving["ang_diff"] > WRONG_WAY_ANGLE_DEG]
+        if wrong.empty:
+            return []
+
+        duration = float(wrong["timestamp"].max()) - float(wrong["timestamp"].min())
+        if duration < WRONG_WAY_MIN_DURATION_S and len(wrong) < 5:
+            return []
+
+        return [RuleViolation(
+            rule_id="WRONG_WAY",
+            description=(
+                f"Vehicle {track_id} travelling against expected flow direction "
+                f"(mean heading {wrong['heading_deg'].mean():.0f}° vs expected {flow_direction_deg:.0f}°)"
+            ),
+            track_id=track_id,
+            first_occurrence_s=float(wrong["timestamp"].iloc[0]),
+            severity="violation",
+            evidence={
+                "expected_flow_direction_deg": flow_direction_deg,
+                "mean_heading_deg": round(float(wrong["heading_deg"].mean()), 1),
+                "mean_angular_difference_deg": round(float(wrong["ang_diff"].mean()), 1),
+                "duration_s": round(duration, 2),
+                "frames_flagged": int(len(wrong)),
+            },
+        )]
+
+    @staticmethod
+    def _check_stationary_in_lane(
+        df: pd.DataFrame,
+        track_id: int,
+    ) -> List[RuleViolation]:
+        """
+        STATIONARY_IN_LANE — vehicle stopped in an active lane for > 10 s.
+
+        Groups consecutive stopped frames into segments (gap < 2 s between rows
+        is considered the same stop event) and flags any segment lasting longer
+        than STATIONARY_MIN_DURATION_S.  This catches broken-down vehicles,
+        double-parking incidents, and stalled vehicles — all primary causes
+        of secondary collisions.
+        """
+        stopped = df[df["speed"] < STATIONARY_SPEED_THRESHOLD_MS]
+        if stopped.empty:
+            return []
+
+        times = stopped["timestamp"].values
+        if len(times) < 2:
+            return []
+
+        # Build contiguous stop segments: consecutive rows within 2 s of each other.
+        segments: List[tuple] = []
+        seg_start = seg_end = times[0]
+        for i in range(1, len(times)):
+            if times[i] - times[i - 1] < 2.0:
+                seg_end = times[i]
+            else:
+                segments.append((seg_start, seg_end))
+                seg_start = seg_end = times[i]
+        segments.append((seg_start, seg_end))
+
+        long_stops = [(s, e) for s, e in segments if e - s >= STATIONARY_MIN_DURATION_S]
+        if not long_stops:
+            return []
+
+        first_start = long_stops[0][0]
+        max_duration = max(e - s for s, e in long_stops)
+
+        return [RuleViolation(
+            rule_id="STATIONARY_IN_LANE",
+            description=(
+                f"Vehicle {track_id} stationary in active lane — "
+                f"longest stop {max_duration:.1f}s"
+            ),
+            track_id=track_id,
+            first_occurrence_s=float(first_start),
+            severity="warning",
+            evidence={
+                "max_stop_duration_s": round(max_duration, 2),
+                "threshold_s": STATIONARY_MIN_DURATION_S,
+                "stop_events": len(long_stops),
+                "speed_threshold_ms": STATIONARY_SPEED_THRESHOLD_MS,
             },
         )]
