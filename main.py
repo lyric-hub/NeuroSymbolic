@@ -57,7 +57,7 @@ def _vlm_worker(
          timestamp, frame_id, vehicle_first_seen, behavior_summary)
     A sentinel value of None signals the worker to shut down cleanly.
     """
-    from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext
+    from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext, draw_zone_overlay
     from src.semantic_abstractor.vlm_inference import TrafficSemanticAbstractor
     from src.semantic_abstractor.entity_extractor import EntityExtractor
     from src.memory_layer.milvus_client import SemanticVectorStore
@@ -87,37 +87,74 @@ def _vlm_worker(
             task_queue.task_done()
             break
 
+        # Unpack task — zone_occupants and zone_cfg are optional (backward compat).
+        task_fields = task
         (frame, tracked_boxes, state_vectors, warm_tracks,
          timestamp, frame_id,
-         vehicle_first_seen, behavior_summary) = task
+         vehicle_first_seen, behavior_summary) = task_fields[:8]
+        zone_occupants = task_fields[8] if len(task_fields) > 8 else frozenset()
+        zone_cfg       = task_fields[9] if len(task_fields) > 9 else None
 
         HISTORY_WINDOW_SECS = 5.0
         chunk_start = max(0.0, timestamp - HISTORY_WINDOW_SECS)
         time_window_ptr = f"{chunk_start:.1f}-{timestamp:.1f}"
 
         # 1. Set-of-Mark visual grounding
+        #    When a zone is active:
+        #      a) Apply spotlight overlay (dims outside, draws zone border/gates)
+        #         BEFORE badge rendering so badges appear on top at full brightness.
+        #      b) Pass zone_occupant_ids to the render context so only in-zone
+        #         vehicles receive SoM badges — out-of-zone vehicles are invisible
+        #         to the VLM (no ID = no hallucination about them).
         som_frame = frame.copy()
+        if zone_cfg is not None and zone_cfg.polygon:
+            draw_zone_overlay(
+                som_frame,
+                zone_cfg.polygon,
+                gates=zone_cfg.gates,
+                zone_id=zone_cfg.zone_id,
+            )
         render_ctx = RenderContext()
         render_ctx.update(tracked_boxes, timestamp)
+        if zone_occupants:
+            render_ctx.zone_occupant_ids = zone_occupants
         renderer.render(som_frame, render_ctx)
         som_pil = Image.fromarray(cv2.cvtColor(som_frame, cv2.COLOR_BGR2RGB))
 
-        # Append frame + its (timestamp, IDs) to parallel buffers
+        # Append frame + its (timestamp, IDs) to parallel buffers.
+        # When zone is active, only record IDs for in-zone vehicles so the
+        # per-frame timeline injected into the VLM prompt stays zone-scoped.
+        frame_ids_this = frozenset(
+            int(t[4]) for t in tracked_boxes
+            if (not zone_occupants or int(t[4]) in zone_occupants)
+        )
         _som_buffer.append(som_pil)
-        _id_buffer.append((timestamp, frozenset(int(t[4]) for t in tracked_boxes)))
+        _id_buffer.append((timestamp, frame_ids_this))
 
         # Build per-frame ID timeline from the buffer for the VLM prompt.
-        # Gives the model precise temporal presence — it can tell which
-        # vehicles co-existed and which never shared a frame.
         frame_id_timeline = [(ts, sorted(ids)) for ts, ids in _id_buffer]
         all_active_ids = sorted(set().union(*(ids for _, ids in _id_buffer)))
+
+        # Filter state_vectors to zone occupants so VLM physics context is focused.
+        vlm_state_vectors = (
+            {k: v for k, v in state_vectors.items() if k in zone_occupants}
+            if zone_occupants else state_vectors
+        )
+
+        # Build zone_context dict for VLM prompt injection.
+        zone_context = None
+        if zone_cfg is not None and zone_occupants:
+            zone_context = {
+                "zone_id": zone_cfg.zone_id,
+                "occupant_ids": sorted(zone_occupants),
+            }
 
         # 2. VLM inference
         with time_operation() as _vlm_timer:
             vlm_triples = vlm.generate_scene_graph_triples(
                 list(_som_buffer),
                 timestamp,
-                state_vectors,
+                vlm_state_vectors,
                 warm_tracks,
                 behavior_summary=behavior_summary,
                 fps=3.0,
@@ -126,6 +163,7 @@ def _vlm_worker(
                 frame_id_timeline=frame_id_timeline,
                 reference_name=reference_name,
                 nearest_landmark_fn=nearest_landmark_fn,
+                zone_context=zone_context,
             )
         if metrics is not None:
             metrics.record_vlm_call(
@@ -261,6 +299,7 @@ def process_video(
     # Zone manager is optional — only active when zone_config.json exists.
     # Draw zones at /zone-ui before running the pipeline.
     zone_manager = None
+    zone_config = None
     if Path("zone_config.json").exists():
         zone_config = ZoneConfig.from_json("zone_config.json")
         zone_manager = ZoneManager(zone_config)
@@ -365,10 +404,21 @@ def process_video(
         )
 
         if run_vlm and _run_macro:
-            # Pre-compute behavior_summary on the main thread (fast DuckDB read)
-            # so the worker has it immediately without touching DuckDB itself.
+            # Identify which vehicles are currently inside the zone (if any).
+            # This drives both behavior_summary filtering and VLM visual focus.
+            zone_occupants: frozenset = frozenset()
+            if zone_manager is not None:
+                zone_occupants = zone_manager.get_zone_occupants()
+
+            # Pre-compute behavior_summary on the main thread (fast DuckDB read).
+            # When a zone is active and occupied, only request kinematics for
+            # zone vehicles — the VLM doesn't need out-of-zone narrative.
             active_ids = [int(t[4]) for t in tracked_boxes]
-            behavior_summary = duckdb_client.get_behavior_summary(active_ids, timestamp)
+            if zone_occupants:
+                summary_ids = [i for i in active_ids if i in zone_occupants]
+            else:
+                summary_ids = active_ids
+            behavior_summary = duckdb_client.get_behavior_summary(summary_ids, timestamp)
 
             task = (
                 frame.copy(),
@@ -379,6 +429,8 @@ def process_video(
                 frame_id,
                 dict(_vehicle_first_seen),
                 behavior_summary,
+                zone_occupants,           # NEW: frozenset of in-zone track IDs
+                zone_config if zone_manager is not None else None,  # NEW: ZoneConfig or None
             )
             try:
                 _vlm_queue.put_nowait(task)

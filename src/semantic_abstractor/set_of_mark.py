@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import FrozenSet, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -58,11 +58,16 @@ class RenderContext:
         tracks (List[TrackState]): List of active track states.
         density (int): Number of active objects.
         timestamp (float): Frame timestamp.
+        zone_occupant_ids (Optional[FrozenSet[int]]): When set, only vehicles
+            in this set receive SoM badges.  Vehicles outside the zone are
+            rendered without an ID so the VLM cannot reference them.
+            None means no zone filter (all tracks rendered).
     """
 
     tracks: List[TrackState] = field(default_factory=list)
     density: int = 0
     timestamp: float = 0.0
+    zone_occupant_ids: Optional[FrozenSet[int]] = None
 
     def update(
         self, raw_tracks: np.ndarray, timestamp: Optional[float] = None
@@ -117,6 +122,90 @@ class BaseRenderer:
             NotImplementedError: If not overridden by subclass.
         """
         raise NotImplementedError("Subclasses must implement render().")
+
+
+# ---------------------------------------------------------------------
+# Zone overlay — spotlight effect for VLM visual grounding
+# ---------------------------------------------------------------------
+
+
+def draw_zone_overlay(
+    frame: np.ndarray,
+    polygon: List[Tuple[float, float]],
+    gates: Optional[List] = None,
+    zone_id: str = "",
+    outside_alpha: float = 0.35,
+) -> None:
+    """
+    Apply a spotlight effect so the VLM visually focuses on the zone.
+
+    Effect:
+    - Everything **outside** the zone polygon is dimmed by ``outside_alpha``
+      (0.35 = 65% darker), creating a vignette that draws VLM attention inward.
+    - The zone boundary is drawn as a bright cyan polygon border (2 px).
+    - Each gate is drawn as a yellow line with its name label at the midpoint.
+    - The zone_id label is placed at the top-left corner of the polygon.
+
+    This is called on the SoM frame **before** badge rendering so that badges
+    appear on top of the overlay at full brightness.
+
+    Args:
+        frame:         BGR image array, modified in-place.
+        polygon:       Zone polygon as [(x, y), ...] in pixel coordinates.
+        gates:         Optional list of Gate-like objects with .name, .p1, .p2.
+        zone_id:       Human-readable zone label drawn on the frame.
+        outside_alpha: Brightness multiplier for the outside region (0–1).
+    """
+    if not polygon:
+        return
+
+    pts = np.array(polygon, dtype=np.int32)
+
+    # --- Spotlight: dim outside the zone -----------------------------------
+    # Build a single-channel mask: 255 inside polygon, 0 outside.
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 255)
+
+    # Multiply outside pixels by outside_alpha in-place (no copy needed).
+    outside = mask == 0
+    frame[outside] = (frame[outside].astype(np.float32) * outside_alpha).astype(np.uint8)
+
+    # --- Zone border -------------------------------------------------------
+    # Cyan (BGR: 255, 200, 0) — high contrast against both bright and dark scenes.
+    ZONE_COLOR = (0, 220, 180)
+    cv2.polylines(frame, [pts], isClosed=True, color=ZONE_COLOR, thickness=2)
+
+    # --- Zone ID label -----------------------------------------------------
+    if zone_id:
+        lx = int(pts[:, 0].min())
+        ly = int(pts[:, 1].min()) - 6
+        ly = max(14, ly)  # clamp above top edge
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label = f"ZONE: {zone_id}"
+        (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
+        # Dark background pill for readability
+        cv2.rectangle(frame, (lx - 2, ly - th - 3), (lx + tw + 2, ly + 2),
+                      (0, 0, 0), -1)
+        cv2.putText(frame, label, (lx, ly), font, 0.45, ZONE_COLOR, 1, cv2.LINE_AA)
+
+    # --- Gate lines + labels -----------------------------------------------
+    if gates:
+        GATE_COLOR = (0, 220, 255)  # yellow-ish
+        for gate in gates:
+            p1 = (int(gate.p1[0]), int(gate.p1[1]))
+            p2 = (int(gate.p2[0]), int(gate.p2[1]))
+            cv2.line(frame, p1, p2, GATE_COLOR, 2)
+            # Arrow tips to show directionality
+            cv2.arrowedLine(frame, p1, p2, GATE_COLOR, 1, tipLength=0.15)
+            # Gate name at midpoint with dark background
+            mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), _ = cv2.getTextSize(gate.name, font, 0.4, 1)
+            cv2.rectangle(frame,
+                          (mid[0] - 2, mid[1] - th - 2),
+                          (mid[0] + tw + 2, mid[1] + 2),
+                          (0, 0, 0), -1)
+            cv2.putText(frame, gate.name, mid, font, 0.4, GATE_COLOR, 1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------
@@ -183,6 +272,11 @@ class UltraMinimalRenderer(BaseRenderer):
 
     def render(self, frame: np.ndarray, context: RenderContext) -> None:
         for track in context.tracks:
+            # Zone filter: skip badges for vehicles outside the zone so the
+            # VLM cannot reference or reason about out-of-zone vehicles.
+            if (context.zone_occupant_ids is not None
+                    and track.track_id not in context.zone_occupant_ids):
+                continue
             self._draw_track(frame, track)
 
     def _draw_track(self, frame: np.ndarray, track: TrackState) -> None:
@@ -217,6 +311,9 @@ class AdaptiveRenderer(BaseRenderer):
         """
         Render using adaptive strategy.
 
+        Zone filter is propagated to both paths: when context.zone_occupant_ids
+        is set, only in-zone vehicles receive SoM badges in either mode.
+
         Args:
             frame (np.ndarray): BGR image frame.
             context (RenderContext): The context to track densities.
@@ -237,6 +334,11 @@ class AdaptiveRenderer(BaseRenderer):
             context (RenderContext): Items to draw.
         """
         for track in context.tracks:
+            # Zone filter: skip out-of-zone vehicles entirely
+            if (context.zone_occupant_ids is not None
+                    and track.track_id not in context.zone_occupant_ids):
+                continue
+
             x1, y1, x2, y2 = track.box
             cx, cy = track.center
 

@@ -421,6 +421,20 @@ class ZoneManager:
                 })
         return rows
 
+    def get_zone_occupants(self) -> frozenset:
+        """
+        Returns the frozenset of track_ids currently inside the zone polygon.
+
+        This is the authoritative in-session source for "who is in the zone
+        right now".  Used by the VLM worker to:
+          - filter SoM rendering to zone vehicles only
+          - filter behavior_summary to zone vehicles only
+          - inject occupant list into the VLM prompt
+        """
+        return frozenset(
+            tid for tid, state in self._vehicle_state.items() if state.inside
+        )
+
     def get_gate_counts(self) -> Dict[str, Dict[str, int]]:
         """
         Returns cumulative enter/exit counts per gate (confirmed + estimated).

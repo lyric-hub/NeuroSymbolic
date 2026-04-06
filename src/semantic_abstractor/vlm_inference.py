@@ -150,6 +150,7 @@ class TrafficSemanticAbstractor:
         frame_id_timeline: Optional[List[tuple]] = None,
         reference_name: str = "Origin",
         nearest_landmark_fn=None,
+        zone_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generates enriched SPO triples from a sequence of SoM frames.
@@ -201,6 +202,26 @@ class TrafficSemanticAbstractor:
                 + "\n"
             )
 
+        # --- Zone context ----------------------------------------------------
+        # Injected when a zone polygon is active.  Tells the VLM:
+        #   - which zone is highlighted in the video frames
+        #   - which vehicle IDs are currently inside it
+        # The frame already has a spotlight overlay (outside dimmed, border
+        # drawn) so this text reinforces the visual signal.
+        zone_block = ""
+        if zone_context:
+            zid = zone_context.get("zone_id", "")
+            occupants = sorted(zone_context.get("occupant_ids", []))
+            n = len(occupants)
+            zone_block = (
+                f"\n## Zone of Interest: '{zid}'\n"
+                f"The video frames show a highlighted zone (bright border, dimmed exterior). "
+                f"There {'is' if n == 1 else 'are'} currently {n} vehicle{'s' if n != 1 else ''} "
+                f"inside this zone: {occupants}.\n"
+                "Describe ONLY interactions that occur within or at the boundary of this zone. "
+                "Ignore vehicles outside the highlighted area.\n"
+            )
+
         # --- ID constraint ---------------------------------------------------
         # Priority order:
         # 1. all_active_ids — union of IDs across all frames in the buffer
@@ -241,6 +262,7 @@ class TrafficSemanticAbstractor:
         system_prompt = (
             "You are an expert autonomous driving and traffic safety analyst. "
             "Analyze the provided traffic camera footage. Vehicles are marked with numerical IDs. "
+            + zone_block
             + id_constraint
             + physics_block
             + "Step 1 — Think briefly (1–2 sentences) about the most safety-critical interactions. "
