@@ -6,7 +6,6 @@ import threading
 import queue as queue_module
 from collections import deque
 from pathlib import Path
-from typing import Optional
 from PIL import Image
 import numpy as np
 
@@ -22,9 +21,6 @@ from src.memory_layer.duckdb_client import DuckDBClient
 
 # --- Phase 4: Agentic Orchestrator ---
 from src.agentic_orchestrator.sequential_pipeline import agent_app, AGENT_INVOKE_CONFIG
-
-# --- Phase 6: Evaluation Metrics ---
-from src.evaluation.metrics import MetricsCollector, time_operation
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +41,6 @@ YOLO_CLASS_NAMES: dict = {
 def _vlm_worker(
     task_queue: queue_module.Queue,
     stop_event: threading.Event,
-    metrics: Optional["MetricsCollector"],
     reference_name: str = "Origin",
     nearest_landmark_fn=None,
 ) -> None:
@@ -62,7 +57,6 @@ def _vlm_worker(
     from src.semantic_abstractor.entity_extractor import EntityExtractor
     from src.memory_layer.milvus_client import SemanticVectorStore
     from src.memory_layer.graph_client import GraphClient
-    from src.evaluation.metrics import time_operation
 
     renderer = AdaptiveRenderer()
     vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
@@ -150,39 +144,29 @@ def _vlm_worker(
             }
 
         # 2. VLM inference
-        with time_operation() as _vlm_timer:
-            vlm_triples = vlm.generate_scene_graph_triples(
-                list(_som_buffer),
-                timestamp,
-                vlm_state_vectors,
-                warm_tracks,
-                behavior_summary=behavior_summary,
-                fps=3.0,
-                tracked_boxes=tracked_boxes,
-                all_active_ids=all_active_ids,
-                frame_id_timeline=frame_id_timeline,
-                reference_name=reference_name,
-                nearest_landmark_fn=nearest_landmark_fn,
-                zone_context=zone_context,
-            )
-        if metrics is not None:
-            metrics.record_vlm_call(
-                latency_ms=_vlm_timer.elapsed_ms,
-                parse_success=bool(vlm_triples),
-                triple_count=len(vlm_triples) if vlm_triples else 0,
-            )
+        vlm_triples = vlm.generate_scene_graph_triples(
+            list(_som_buffer),
+            timestamp,
+            vlm_state_vectors,
+            warm_tracks,
+            behavior_summary=behavior_summary,
+            fps=3.0,
+            tracked_boxes=tracked_boxes,
+            all_active_ids=all_active_ids,
+            frame_id_timeline=frame_id_timeline,
+            reference_name=reference_name,
+            nearest_landmark_fn=nearest_landmark_fn,
+            zone_context=zone_context,
+        )
 
         if vlm_triples:
             nl_description = " ".join(
                 f"{t['subject']} {t['predicate']} {t['object']}."
                 for t in vlm_triples
             )
-            with time_operation() as _milvus_timer:
-                milvus_client.insert_event_chunk(
-                    nl_description, chunk_start, timestamp, frame_id
-                )
-            if metrics is not None:
-                metrics.record_milvus_insert(_milvus_timer.elapsed_ms)
+            milvus_client.insert_event_chunk(
+                nl_description, chunk_start, timestamp, frame_id
+            )
 
             scene_description = json.dumps(vlm_triples)
             active_ids = [int(t[4]) for t in tracked_boxes]
@@ -191,10 +175,7 @@ def _vlm_worker(
             )
 
             if validated_triples:
-                with time_operation() as _graph_timer:
-                    graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
-                if metrics is not None:
-                    metrics.record_graph_insert(_graph_timer.elapsed_ms)
+                graph_client.insert_vlm_triples(validated_triples, time_window_ptr)
 
                 if _prev_window_ptr is not None:
                     gap_s = (float(time_window_ptr.split("-")[0])
@@ -233,7 +214,6 @@ def _vlm_worker(
 def process_video(
     video_path: str,
     progress_callback=None,
-    metrics: Optional[MetricsCollector] = None,
     run_physics: bool = True,
     run_vlm: bool = True,
     model_path: str = "yolov8n.pt",
@@ -247,9 +227,6 @@ def process_video(
         video_path:         Path to the input video file.
         progress_callback:  Optional callable(frames_done: int, total_frames: int)
                             invoked once per frame so callers can track progress.
-        metrics:            Optional MetricsCollector that records proxy evaluation
-                            metrics (VLM quality, DB latency, alert distribution).
-                            Call metrics.log_summary() after this function returns.
     """
     log.info("Initializing Neuro-Symbolic Pipeline...")
 
@@ -275,7 +252,23 @@ def process_video(
     tracker = VehicleTracker(tracker_name="bytetrack")
     if run_physics:
         transformer = CoordinateTransformer("calibration.yaml")
-        kinematics = KinematicEstimator(fps=float(fps))
+
+        # Read ByteTrack's track_buffer so KinematicEstimator's grace period
+        # matches exactly — a track the estimator has forgotten but ByteTrack
+        # can still re-associate would otherwise restart a 15-frame SG warm-up.
+        _bt_missed = 30  # ByteTrack default track_buffer
+        try:
+            from boxmot.utils import TRACKER_CONFIGS
+            import yaml as _yaml
+            _bt_cfg = _yaml.safe_load(
+                (Path(TRACKER_CONFIGS) / "bytetrack.yaml").read_text()
+            )
+            _bt_missed = _bt_cfg.get("track_buffer", {}).get("default", 30)
+        except Exception:
+            pass  # fall back to 30
+        log.info("KinematicEstimator max_missed_frames aligned to ByteTrack track_buffer=%d", _bt_missed)
+
+        kinematics = KinematicEstimator(fps=float(fps), max_missed_frames=_bt_missed)
         duckdb_client.set_named_points(transformer.named_points, transformer.reference_name)
         log.info(
             "Reference point: '%s' | Named landmarks: %s",
@@ -316,7 +309,7 @@ def process_video(
         _nearest_fn = transformer.nearest_landmark if run_physics else None
         _vlm_thread = threading.Thread(
             target=_vlm_worker,
-            args=(_vlm_queue, _vlm_stop, metrics, _ref_name, _nearest_fn),
+            args=(_vlm_queue, _vlm_stop, _ref_name, _nearest_fn),
             name="vlm-worker",
             daemon=True,
         )
@@ -325,9 +318,6 @@ def process_video(
 
     frame_id = 0
     start_time = time.time()
-    if metrics is not None:
-        metrics.begin()
-
     log.info("--- Starting Video Processing ---")
     while cap.isOpened():
         ret, frame = cap.read()
@@ -347,12 +337,31 @@ def process_video(
         # 2-7. Physics sub-loop — kinematics, DuckDB, alerts, zones
         if run_physics:
             real_coords = transformer.get_real_world_coords(tracked_boxes)
-            state_vectors = kinematics.update(real_coords)
+            state_vectors, synthetic_rows = kinematics.update(
+                real_coords, timestamp, frame_id
+            )
             class_labels = {
                 int(t[4]): YOLO_CLASS_NAMES.get(int(t[6]), "unknown")
                 for t in tracked_boxes
             }
-            duckdb_client.insert_state_vectors(timestamp, frame_id, state_vectors, class_labels)
+            # Column 5 of tracked_boxes is the YOLO detection confidence (0–1).
+            # Stored in DuckDB so data quality reports can compute mean confidence
+            # per vehicle/window and flag low-confidence analyses.
+            detection_confidences = {
+                int(t[4]): float(t[5])
+                for t in tracked_boxes
+            }
+            duckdb_client.insert_state_vectors(
+                timestamp, frame_id, state_vectors, class_labels, detection_confidences
+            )
+            # Write gap-filled synthetic rows (interpolated=True) so DuckDB has
+            # a continuous time-series with no holes from missed detections.
+            if synthetic_rows:
+                duckdb_client.insert_interpolated_rows(synthetic_rows, class_labels)
+                log.debug(
+                    "[%.1fs] Persisted %d interpolated rows for gap-filled tracks",
+                    timestamp, len(synthetic_rows),
+                )
 
             for tid in state_vectors:
                 if tid not in _vehicle_first_seen:
@@ -381,17 +390,6 @@ def process_video(
         # ==========================================
         # THE MACRO-LOOP (Low-Frequency Semantics)
         # ==========================================
-
-        # Detect interval frames that get skipped by the motion gate (for metrics).
-        _is_interval_frame = (
-            frame_id > 0
-            and len(tracked_boxes) > 0
-            and frame_id % semantic_interval == 0
-        )
-        if (metrics is not None
-                and _is_interval_frame
-                and _motion_score < MOTION_SKIP_THRESHOLD):
-            metrics.record_motion_skip()
 
         # MACRO-LOOP condition:
         #   - Fixed interval: every semantic_interval frames (~3/sec)
@@ -444,9 +442,6 @@ def process_video(
         if progress_callback is not None:
             progress_callback(frame_id, total_frames)
 
-        if metrics is not None:
-            metrics.record_frame()
-
         frame_id += 1
 
     cap.release()
@@ -460,10 +455,6 @@ def process_video(
 
     # Safely close database connections
     duckdb_client.close()
-
-    if metrics is not None:
-        metrics.end()
-        metrics.log_summary()
 
 def interactive_agent_loop():
     """Boots up the LangGraph agent to query the processed hybrid databases."""

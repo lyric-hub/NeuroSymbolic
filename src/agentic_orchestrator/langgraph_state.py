@@ -1,4 +1,4 @@
-from typing import Annotated, TypedDict
+from typing import Annotated, List, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
@@ -8,9 +8,13 @@ class AgentState(TypedDict):
     query: str
 
     # Intent class set by the router node before the agent runs.
-    # 'full_analysis'   → all 5 tools available
+    # 'full_analysis'   → all tools available
     # 'semantic_lookup' → only search_semantic_events available (Milvus only)
     route: str
+
+    # Human-readable explanation of why the router chose this route.
+    # Included in final_summary so users know what analysis depth was applied.
+    routing_explanation: str
 
     # Structured analysis plan produced by the PlannerNode.
     # Populated only for 'full_analysis' queries; empty string otherwise.
@@ -24,3 +28,16 @@ class AgentState(TypedDict):
 
     # Final answer extracted from the last AIMessage — kept for API compatibility.
     final_summary: str
+
+    # Ordered list of tool calls made during this session — extracted from the
+    # message history in finalize() and written to DuckDB analysis_sessions.
+    # Each step: {step, tool, args, output_excerpt}.
+    reasoning_steps: List[dict]
+
+    # UUID identifying this query session — links final_summary to its
+    # reasoning trace in the analysis_sessions DuckDB table.
+    session_id: str
+
+    # Neural-symbolic contradiction flags produced by the contradiction_check
+    # node.  Non-empty list means the VLM and rule engine disagreed.
+    contradictions: List[str]

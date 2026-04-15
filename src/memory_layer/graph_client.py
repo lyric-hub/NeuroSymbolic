@@ -92,6 +92,25 @@ class GraphClient:
         except RuntimeError:
             pass  # Already exists
 
+        # CAUSES — causal attribution between a rule violation and a downstream
+        # conflict or event.  Written by the agent when it determines causation.
+        # Example: Vehicle 4's SPEEDING CAUSES TTC_CRITICAL with Vehicle 9.
+        # Enables Cypher queries like:
+        #   MATCH (c:Vehicle)-[r:CAUSES]->(e:Vehicle) RETURN c.name, r.cause_rule, e.name
+        try:
+            self.conn.execute("""
+                CREATE REL TABLE CAUSES (
+                    FROM Vehicle TO Vehicle,
+                    cause_rule    STRING,
+                    effect_type   STRING,
+                    confidence    DOUBLE,
+                    time_window   STRING,
+                    severity_score DOUBLE
+                )
+            """)
+        except RuntimeError:
+            pass  # Already exists
+
     def _migrate_interacts_with(self) -> None:
         """
         Adds motion_state and phase columns to an existing INTERACTS_WITH table
@@ -300,6 +319,72 @@ class GraphClient:
             log.info("HAS_VIOLATION written: Vehicle %d — %s", track_id, violation_type)
         except Exception as exc:
             log.warning("HAS_VIOLATION insert failed for Vehicle %d: %s", track_id, exc)
+
+    def insert_causal_link(
+        self,
+        cause_track_id: int,
+        cause_rule: str,
+        effect_track_id: int,
+        effect_type: str,
+        time_window: str,
+        confidence: float = 0.8,
+        severity_score: float = 0.0,
+    ) -> None:
+        """
+        Records a causal relationship between a rule violation and a downstream
+        conflict or event in the Kùzu graph.
+
+        This is the key explainability edge: it converts "A violated a rule AND
+        there was a conflict" (correlation) into "A's violation CAUSED the conflict"
+        (causation), as determined by the agent's explicit reasoning.
+
+        Enables Cypher queries such as:
+            MATCH (c:Vehicle)-[r:CAUSES]->(e:Vehicle)
+            WHERE c.name = 'Vehicle 4'
+            RETURN c.name, r.cause_rule, r.effect_type, e.name, r.confidence
+
+        Args:
+            cause_track_id:  Vehicle ID of the violating vehicle (the cause).
+            cause_rule:      Rule that fired, e.g. 'SPEEDING', 'WRONG_WAY'.
+            effect_track_id: Vehicle ID of the vehicle that suffered the effect.
+            effect_type:     Type of downstream event, e.g. 'TTC_CRITICAL',
+                             'COLLISION', 'HARD_BRAKING'.
+            time_window:     Time range string e.g. '5.0-20.0'.
+            confidence:      Agent's confidence in the causal attribution (0–1).
+            severity_score:  Severity of the causing violation (0–1).
+        """
+        cause_name  = f"Vehicle {cause_track_id}"
+        effect_name = f"Vehicle {effect_track_id}"
+        self._upsert_entity(cause_name, "Vehicle")
+        self._upsert_entity(effect_name, "Vehicle")
+        try:
+            self.conn.execute(
+                """
+                MATCH (c:Vehicle {name: $cause}), (e:Vehicle {name: $effect})
+                CREATE (c)-[:CAUSES {
+                    cause_rule:    $rule,
+                    effect_type:   $etype,
+                    confidence:    $conf,
+                    time_window:   $window,
+                    severity_score: $score
+                }]->(e)
+                """,
+                parameters={
+                    "cause":  cause_name,
+                    "effect": effect_name,
+                    "rule":   cause_rule,
+                    "etype":  effect_type,
+                    "conf":   float(confidence),
+                    "window": time_window,
+                    "score":  float(severity_score),
+                },
+            )
+            log.info(
+                "CAUSES edge: Vehicle %d [%s] → Vehicle %d [%s] (conf=%.2f)",
+                cause_track_id, cause_rule, effect_track_id, effect_type, confidence,
+            )
+        except Exception as exc:
+            log.warning("CAUSES insert failed: %s", exc)
 
     def query_graph(self, cypher_query: str) -> List[Dict[str, Any]]:
         """

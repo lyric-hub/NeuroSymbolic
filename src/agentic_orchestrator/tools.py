@@ -1,7 +1,7 @@
 """
 LangGraph Agent Tools — Neuro-Symbolic Bridge
 ==============================================
-Fifteen LangChain tools that expose the hybrid memory layer to the ReAct agent.
+Nineteen LangChain tools that expose the hybrid memory layer to the ReAct agent.
 Each tool maps to a distinct reasoning modality:
 
   search_semantic_events      → Milvus ANN search (event-level)      (neural)
@@ -19,6 +19,12 @@ Each tool maps to a distinct reasoning modality:
   get_vehicle_count_report    → Flow rate / volume per time period   (symbolic)
   detect_traffic_queue        → Queue / congestion episode detection  (symbolic)
   get_turning_movement_counts → Gate-level TMC matrix                (symbolic)
+
+  --- Explainability tools ---
+  get_data_quality_report     → Real vs interpolated frames, detection confidence (symbolic)
+  explain_threshold           → Source standard behind each rule threshold        (symbolic)
+  link_violation_to_conflict  → Write CAUSES edge to Kùzu causal graph           (symbolic)
+  get_reasoning_trace         → Retrieve prior session's tool call audit log      (symbolic)
 
 Tools are lazy-initialised: DB connections open on first use, not at
 import time, so the FastAPI server starts cleanly even when a DB is not
@@ -363,11 +369,24 @@ def evaluate_traffic_rules(
         flow_direction_deg=flow_direction_deg,
     )
 
+    # Collect assumptions from the first violation (all share the same assumptions)
+    # or from the evaluation context directly.
+    eval_assumptions = []
+    if speed_limit_ms is None:
+        eval_assumptions.append(
+            "speed_limit_kmh defaulted to 50 km/h — zone_config.json not found or field absent"
+        )
+    if flow_direction_deg is None:
+        eval_assumptions.append(
+            "WRONG_WAY rule disabled — flow_direction_deg not set in zone_config.json"
+        )
+
     if not violations:
         return json.dumps({
             "vehicle_id": track_id,
             "result": "NO_VIOLATIONS",
             "message": "No traffic rule violations detected in this time window.",
+            "_assumptions": eval_assumptions,
         }, indent=2)
 
     # Feedback loop — write violations back to Kùzu so the graph has
@@ -387,6 +406,7 @@ def evaluate_traffic_rules(
         "vehicle_id": track_id,
         "violation_count": len(violations),
         "violations": [v.to_dict() for v in violations],
+        "_assumptions": eval_assumptions,
     }, indent=2)
 
 
@@ -895,4 +915,193 @@ def get_turning_movement_counts(
         "time_window": f"{start_time}-{end_time}",
         "total_movements": total,
         "tmc_matrix": rows,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 16 — Data quality report (DuckDB)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_data_quality_report(
+    track_id: int = -1,
+    start_time: float = 0.0,
+    end_time: float = 9_999_999.0,
+) -> str:
+    """
+    Data Quality Report — real vs interpolated frames, YOLO detection confidence,
+    and gate crossing confidence for a vehicle or the full video.
+
+    ALWAYS call this tool BEFORE citing evaluate_traffic_rules findings in
+    your final answer.  A violation backed by HIGH quality data is a confirmed
+    fact; one backed by LOW quality data is only indicative.
+
+    Quality rating:
+      HIGH   — ≥ 85% real frames AND mean YOLO confidence ≥ 0.6
+      MEDIUM — ≥ 60% real frames AND mean YOLO confidence ≥ 0.4
+      LOW    — below MEDIUM thresholds (treat findings as unconfirmed)
+
+    Args:
+        track_id:   Vehicle ID, or -1 (default) for all vehicles in the window.
+        start_time: Window start in seconds (default: full video).
+        end_time:   Window end in seconds (default: full video).
+
+    Returns JSON with: total_frames, real_frames, interpolated_frames,
+    coverage_pct, mean_detection_confidence, confirmed/estimated gate crossings,
+    data_quality_rating, and a plain-English _interpretation.
+    """
+    log.info(
+        "Tool: get_data_quality_report | vehicle=%s, t=%.1f-%.1f",
+        track_id if track_id >= 0 else "ALL", start_time, end_time,
+    )
+    result = _get_duckdb().get_data_quality_report(track_id, start_time, end_time)
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 17 — Threshold provenance / explain threshold (registry)
+# ---------------------------------------------------------------------------
+
+@tool
+def explain_threshold(rule_name: str) -> str:
+    """
+    Threshold Provenance — explains the engineering standard behind a rule threshold.
+
+    Use when the user asks WHY a specific numeric threshold was chosen, or when
+    citing a rule violation and you need to justify the threshold to a traffic
+    engineer audience.
+
+    Available rule names:
+      HARD_BRAKING, AGGRESSIVE_ACCELERATION, SPEEDING_DEFAULT,
+      TTC_CRITICAL, TTC_SERIOUS, WRONG_WAY_ANGLE, WRONG_WAY_MIN_SPEED,
+      WRONG_WAY_MIN_DURATION, STATIONARY_IN_LANE_DURATION, STATIONARY_SPEED,
+      V85_DESIGN_SPEED
+
+    Args:
+        rule_name: Rule name (case-insensitive, e.g. "HARD_BRAKING" or "ttc critical").
+
+    Returns JSON with: rule, value, unit, source standard, full description.
+    """
+    log.info("Tool: explain_threshold | rule='%s'", rule_name)
+    from src.symbolic_engine.threshold_registry import explain_threshold as _explain
+    result = _explain(rule_name)
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 18 — Causal link writer (Kùzu CAUSES edge)
+# ---------------------------------------------------------------------------
+
+@tool
+def link_violation_to_conflict(
+    cause_track_id: int,
+    cause_rule: str,
+    effect_track_id: int,
+    effect_type: str,
+    time_window: str,
+    confidence: float = 0.8,
+) -> str:
+    """
+    Causal Attribution — writes a CAUSES edge in the Kùzu graph linking a rule
+    violation to a downstream conflict or event.
+
+    Use this tool ONLY when you have strong evidence (from evaluate_traffic_rules
+    + get_vehicle_proximity or compute_ttc) that one vehicle's violation directly
+    caused a conflict with another vehicle.  This converts correlation into
+    explicit causal memory queryable via Cypher:
+
+        MATCH (c:Vehicle)-[r:CAUSES]->(e:Vehicle)
+        RETURN c.name, r.cause_rule, r.effect_type, e.name, r.confidence
+
+    Args:
+        cause_track_id:  Track ID of the violating vehicle (the cause).
+        cause_rule:      Rule that fired, e.g. 'SPEEDING', 'WRONG_WAY'.
+        effect_track_id: Track ID of the vehicle that experienced the effect.
+        effect_type:     Type of downstream event: 'TTC_CRITICAL', 'TTC_SERIOUS',
+                         'COLLISION', 'HARD_BRAKING', 'NEAR_MISS'.
+        time_window:     Time range string, e.g. '5.0-20.0'.
+        confidence:      Your confidence in this causal attribution (0.0–1.0).
+                         Use 0.9 when physics + rules both corroborate;
+                         0.6 when based on sequence inference only.
+
+    Returns confirmation JSON with the inserted edge details.
+    """
+    log.info(
+        "Tool: link_violation_to_conflict | cause=%d [%s] → effect=%d [%s] conf=%.2f",
+        cause_track_id, cause_rule, effect_track_id, effect_type, confidence,
+    )
+    # Get severity_score from HAS_VIOLATION for the cause vehicle if available
+    severity_score = 0.0
+    try:
+        rows = _get_graph().query_graph(
+            f"MATCH (v:Vehicle {{name: 'Vehicle {cause_track_id}'}})"
+            f"-[r:HAS_VIOLATION]->(v) "
+            f"WHERE r.violation_type = '{cause_rule}' "
+            f"RETURN r.evidence_json LIMIT 1"
+        )
+        if rows and "evidence_json" in rows[0]:
+            pass  # severity_score in evidence_json not yet stored; use 0.0 as default
+    except Exception:
+        pass
+
+    _get_graph().insert_causal_link(
+        cause_track_id=cause_track_id,
+        cause_rule=cause_rule,
+        effect_track_id=effect_track_id,
+        effect_type=effect_type,
+        time_window=time_window,
+        confidence=float(confidence),
+        severity_score=severity_score,
+    )
+    return json.dumps({
+        "status": "CAUSES edge written",
+        "cause": f"Vehicle {cause_track_id}",
+        "cause_rule": cause_rule,
+        "effect": f"Vehicle {effect_track_id}",
+        "effect_type": effect_type,
+        "time_window": time_window,
+        "confidence": confidence,
+        "cypher_to_query": (
+            f"MATCH (c:Vehicle {{name:'Vehicle {cause_track_id}'}})"
+            f"-[r:CAUSES]->(e:Vehicle) RETURN c.name, r.cause_rule, r.effect_type, "
+            f"e.name, r.confidence"
+        ),
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool 19 — Reasoning trace retrieval (DuckDB analysis_sessions)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_reasoning_trace(session_id: str) -> str:
+    """
+    Reasoning Trace — retrieves the full tool-call audit log for a prior query
+    session, showing exactly which tools were called, with what arguments, and
+    what they returned.
+
+    Use when the user asks "how did you reach that conclusion?" or "show me your
+    reasoning for the last analysis."  The session_id is returned in every
+    final_summary under the key [Session ID: ...].
+
+    Args:
+        session_id: UUID string from a prior analysis (shown in final_summary).
+
+    Returns ordered list of steps: step_number, tool_name, input_args,
+    output_excerpt (first 300 chars of tool result), recorded_at timestamp.
+    """
+    log.info("Tool: get_reasoning_trace | session='%s'", session_id)
+    steps = _get_duckdb().get_reasoning_trace(session_id)
+
+    if not steps:
+        return (
+            f"No reasoning trace found for session '{session_id}'. "
+            "Traces are written at the end of each analysis. "
+            "Ensure the session_id is correct."
+        )
+
+    return json.dumps({
+        "session_id": session_id,
+        "step_count": len(steps),
+        "trace": steps,
     }, indent=2)

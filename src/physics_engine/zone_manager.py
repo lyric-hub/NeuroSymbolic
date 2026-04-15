@@ -87,6 +87,10 @@ class Gate:
     name: str
     p1: Tuple[float, float]
     p2: Tuple[float, float]
+    type: str = "bidirectional"
+    """Gate type: ``"entry"`` fires only on inward crossings, ``"exit"`` fires
+    only on outward crossings, ``"bidirectional"`` (default, backward-compatible)
+    fires on both.  Drawn via the zone-ui Entry Gate / Exit Gate buttons."""
 
 
 @dataclass
@@ -111,7 +115,7 @@ class ZoneConfig:
         with open(path) as f:
             data = json.load(f)
         gates = [
-            Gate(g["name"], tuple(g["p1"]), tuple(g["p2"]))
+            Gate(g["name"], tuple(g["p1"]), tuple(g["p2"]), g.get("type", "bidirectional"))
             for g in data.get("gates", [])
         ]
         polygon = [tuple(pt) for pt in data.get("polygon", [])]
@@ -135,7 +139,7 @@ class ZoneConfig:
             "flow_direction_deg": self.flow_direction_deg,
             "polygon": [list(pt) for pt in self.polygon],
             "gates": [
-                {"name": g.name, "p1": list(g.p1), "p2": list(g.p2)}
+                {"name": g.name, "type": g.type, "p1": list(g.p1), "p2": list(g.p2)}
                 for g in self.gates
             ],
         }
@@ -348,8 +352,11 @@ class ZoneManager:
 
                 if inside and self.config.gates:
                     # Vehicle appeared already inside — no crossing history.
-                    # Attribute entry to nearest gate with "estimated" confidence.
-                    gate_name = _nearest_gate_name(curr_pos, self.config.gates)
+                    # Attribute entry to nearest entry-type (or bidirectional) gate.
+                    entry_gates = [
+                        g for g in self.config.gates if g.type in ("entry", "bidirectional")
+                    ] or self.config.gates
+                    gate_name = _nearest_gate_name(curr_pos, entry_gates)
                     self._record_od(tid, gate_name, "enter", timestamp, "estimated")
                     events.append(self._make_event(
                         tid, gate_name, "enter", "estimated",
@@ -371,6 +378,12 @@ class ZoneManager:
                     if pt is None:
                         continue
                     direction = _crossing_direction(prev_pos, curr_pos, gate.p1, gate.p2)
+                    # Respect gate type: entry gate ignores outward crossings,
+                    # exit gate ignores inward crossings.
+                    if gate.type == "entry" and direction != "enter":
+                        continue
+                    if gate.type == "exit" and direction != "exit":
+                        continue
                     events.append(self._make_event(
                         tid, gate.name, direction, "confirmed",
                         timestamp, frame_id, pt, real_pos,
@@ -391,7 +404,11 @@ class ZoneManager:
             if not gate_crossed_this_frame and self.config.gates:
                 if not was_inside and now_inside:
                     # Entered zone without a detected gate crossing.
-                    gate_name = _nearest_gate_name(curr_pos, self.config.gates)
+                    # Only consider entry-typed (or bidirectional) gates.
+                    entry_gates = [
+                        g for g in self.config.gates if g.type in ("entry", "bidirectional")
+                    ] or self.config.gates
+                    gate_name = _nearest_gate_name(curr_pos, entry_gates)
                     if self._vehicle_state[tid].entry_gate is None:
                         self._record_od(tid, gate_name, "enter", timestamp, "estimated")
                         events.append(self._make_event(
@@ -401,7 +418,11 @@ class ZoneManager:
 
                 elif was_inside and not now_inside:
                     # Exited zone without a detected gate crossing.
-                    gate_name = _nearest_gate_name(curr_pos, self.config.gates)
+                    # Only consider exit-typed (or bidirectional) gates.
+                    exit_gates = [
+                        g for g in self.config.gates if g.type in ("exit", "bidirectional")
+                    ] or self.config.gates
+                    gate_name = _nearest_gate_name(curr_pos, exit_gates)
                     self._record_od(tid, gate_name, "exit", timestamp, "estimated")
                     events.append(self._make_event(
                         tid, gate_name, "exit", "estimated",

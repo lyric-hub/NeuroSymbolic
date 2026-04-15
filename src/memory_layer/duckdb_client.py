@@ -28,25 +28,43 @@ class DuckDBClient:
         """Creates tables and indexes for both physics and zone-crossing data."""
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_trajectories (
-                timestamp   DOUBLE,
-                frame_id    UINTEGER,
-                track_id    UINTEGER,
-                pos_x       DOUBLE,
-                pos_y       DOUBLE,
-                vel_x       DOUBLE,
-                vel_y       DOUBLE,
-                accel_x     DOUBLE,
-                accel_y     DOUBLE,
-                class_label VARCHAR
+                timestamp            DOUBLE,
+                frame_id             UINTEGER,
+                track_id             UINTEGER,
+                pos_x                DOUBLE,
+                pos_y                DOUBLE,
+                vel_x                DOUBLE,
+                vel_y                DOUBLE,
+                accel_x              DOUBLE,
+                accel_y              DOUBLE,
+                class_label          VARCHAR,
+                interpolated         BOOLEAN,
+                detection_confidence DOUBLE
             )
         """)
-        # Migration: add class_label to existing databases that pre-date this column.
-        try:
-            self.conn.execute(
-                "ALTER TABLE vehicle_trajectories ADD COLUMN class_label VARCHAR DEFAULT 'unknown'"
+        # Migrations: add columns to existing databases that pre-date them.
+        for migration_sql in [
+            "ALTER TABLE vehicle_trajectories ADD COLUMN class_label VARCHAR DEFAULT 'unknown'",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN interpolated BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN detection_confidence DOUBLE",
+        ]:
+            try:
+                self.conn.execute(migration_sql)
+            except Exception:
+                pass  # column already exists
+
+        # Agent reasoning trace — stores every tool call made during a query
+        # session so the agent's investigation path is fully auditable.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_sessions (
+                session_id     VARCHAR,
+                step_number    UINTEGER,
+                tool_name      VARCHAR,
+                input_args     VARCHAR,
+                output_excerpt VARCHAR,
+                timestamp_s    DOUBLE
             )
-        except Exception:
-            pass  # column already exists
+        """)
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_time_track
             ON vehicle_trajectories(track_id, timestamp)
@@ -105,6 +123,7 @@ class DuckDBClient:
         frame_id: int,
         state_vectors: Dict[int, List[float]],
         class_labels: Dict[int, str] = None,
+        detection_confidences: Dict[int, float] = None,
     ):
         """
         Rapidly ingests the dictionary output from kinematics.py.
@@ -112,21 +131,27 @@ class DuckDBClient:
         flushing to disk every FLUSH_EVERY_N_FRAMES frames.
 
         Args:
-            timestamp:     The current video timestamp (seconds).
-            frame_id:      The current video frame number.
-            state_vectors: Format {track_id: [x, y, v_x, v_y, a_x, a_y]}
-            class_labels:  Optional {track_id: class_name} from YOLO detections
-                           (e.g. "car", "motorcycle", "bus", "truck").
+            timestamp:              The current video timestamp (seconds).
+            frame_id:               The current video frame number.
+            state_vectors:          Format {track_id: [x, y, v_x, v_y, a_x, a_y]}
+            class_labels:           Optional {track_id: class_name} from YOLO detections
+                                    (e.g. "car", "motorcycle", "bus", "truck").
+            detection_confidences:  Optional {track_id: confidence} from YOLO (0.0–1.0).
+                                    Stored so data quality reports can report mean
+                                    detection confidence per vehicle/window.
         """
         if not state_vectors:
             return
 
         _labels = class_labels or {}
+        _confs = detection_confidences or {}
         for track_id, sv in state_vectors.items():
             self._buffer.append((
                 timestamp, frame_id, track_id,
                 sv[0], sv[1], sv[2], sv[3], sv[4], sv[5],
                 _labels.get(track_id, "unknown"),
+                False,                              # interpolated = False for real detections
+                _confs.get(track_id, None),         # detection_confidence (NULL if unknown)
             ))
 
         self._frames_since_flush += 1
@@ -138,11 +163,51 @@ class DuckDBClient:
         if not self._buffer:
             return
         self.conn.executemany(
-            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             self._buffer,
         )
         self._buffer.clear()
         self._frames_since_flush = 0
+
+    def insert_interpolated_rows(
+        self,
+        rows: List[dict],
+        class_labels: Dict[int, str] = None,
+    ) -> None:
+        """
+        Persists synthetic gap-filled rows produced by KinematicEstimator.
+
+        These rows were never actually detected — they are linearly interpolated
+        positions (with SG-smoothed derivatives for warm tracks) covering the
+        frames where a vehicle was absent from the detector output.
+
+        Flagged ``interpolated=TRUE`` in the database so queries can optionally
+        exclude them (e.g. ``WHERE NOT interpolated``) when only measured data
+        is acceptable.  By default they are included so time-window queries have
+        a continuous signal with no temporal gaps.
+
+        Args:
+            rows:         List of dicts from ``KinematicEstimator.update()``,
+                          each with keys: timestamp, frame_id, track_id,
+                          pos_x, pos_y, vel_x, vel_y, accel_x, accel_y.
+            class_labels: Optional ``{track_id: class_name}`` mapping.
+        """
+        if not rows:
+            return
+        _labels = class_labels or {}
+        for row in rows:
+            self._buffer.append((
+                row["timestamp"], row["frame_id"], row["track_id"],
+                row["pos_x"], row["pos_y"],
+                row["vel_x"], row["vel_y"],
+                row["accel_x"], row["accel_y"],
+                _labels.get(row["track_id"], "unknown"),
+                True,   # interpolated = True
+                None,   # detection_confidence = NULL (synthetic row, no YOLO detection)
+            ))
+        # Flush immediately: synthetic rows should be persisted before the next
+        # real frame's data so the timeline stays ordered in DuckDB.
+        self._flush()
 
     def get_trajectory_window(self, start_time: float, end_time: float, track_id: int):
         """
@@ -492,6 +557,167 @@ class DuckDBClient:
                 best_dist = dist
                 best_name = pt["name"]
         return best_name, round(best_dist, 2)
+
+    # ------------------------------------------------------------------
+    # Explainability: data quality + reasoning trace
+    # ------------------------------------------------------------------
+
+    def get_data_quality_report(
+        self,
+        track_id: int = -1,
+        start_time: float = 0.0,
+        end_time: float = 9_999_999.0,
+    ) -> dict:
+        """
+        Returns a data quality summary for a vehicle (or all vehicles) in a
+        time window.
+
+        Covers three quality dimensions:
+          1. Frame coverage — how many rows are real vs interpolated (synthetic).
+          2. Detection confidence — mean YOLO confidence for real frames.
+          3. Gate crossing confidence — confirmed vs estimated crossings.
+
+        Use this BEFORE citing evaluate_traffic_rules findings — a violation
+        based on 95% real frames is much stronger evidence than one based on
+        30% real frames with the rest synthesised by the SG interpolator.
+
+        Args:
+            track_id:   Vehicle ID, or -1 for all vehicles.
+            start_time: Window start in seconds.
+            end_time:   Window end in seconds.
+
+        Returns:
+            Dict with: track_filter, time_window, total_frames, real_frames,
+            interpolated_frames, coverage_pct, mean_detection_confidence,
+            confirmed_gate_crossings, estimated_gate_crossings,
+            data_quality_rating (HIGH / MEDIUM / LOW).
+        """
+        self._flush()
+        track_filter = "" if track_id < 0 else "AND track_id = ?"
+        params_traj = [start_time, end_time] + ([track_id] if track_id >= 0 else [])
+
+        row = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*)                                          AS total_frames,
+                SUM(CASE WHEN NOT interpolated THEN 1 ELSE 0 END) AS real_frames,
+                SUM(CASE WHEN interpolated     THEN 1 ELSE 0 END) AS interp_frames,
+                AVG(CASE WHEN NOT interpolated
+                         THEN detection_confidence END)           AS mean_conf
+            FROM vehicle_trajectories
+            WHERE timestamp >= ? AND timestamp <= ? {track_filter}
+            """,
+            params_traj,
+        ).fetchone()
+
+        total     = int(row[0] or 0)
+        real      = int(row[1] or 0)
+        interp    = int(row[2] or 0)
+        mean_conf = round(float(row[3]), 3) if row[3] is not None else None
+        coverage  = round(100.0 * real / total, 1) if total > 0 else 0.0
+
+        # Gate crossing confidence breakdown
+        params_zc = [start_time, end_time] + ([track_id] if track_id >= 0 else [])
+        zc_filter = "" if track_id < 0 else "AND track_id = ?"
+        zc_row = self.conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN confidence = 'confirmed'  THEN 1 ELSE 0 END),
+                SUM(CASE WHEN confidence = 'estimated'  THEN 1 ELSE 0 END)
+            FROM zone_crossings
+            WHERE timestamp >= ? AND timestamp <= ? {zc_filter}
+            """,
+            params_zc,
+        ).fetchone()
+        confirmed_crossings = int(zc_row[0] or 0)
+        estimated_crossings = int(zc_row[1] or 0)
+
+        # Rating heuristic: HIGH ≥ 85% real + conf ≥ 0.6; LOW < 60% real or conf < 0.4
+        if coverage >= 85.0 and (mean_conf is None or mean_conf >= 0.6):
+            rating = "HIGH"
+        elif coverage >= 60.0 and (mean_conf is None or mean_conf >= 0.4):
+            rating = "MEDIUM"
+        else:
+            rating = "LOW"
+
+        return {
+            "track_filter": track_id if track_id >= 0 else "all",
+            "time_window": f"{start_time}-{end_time}",
+            "total_frames": total,
+            "real_frames": real,
+            "interpolated_frames": interp,
+            "coverage_pct": coverage,
+            "mean_detection_confidence": mean_conf,
+            "confirmed_gate_crossings": confirmed_crossings,
+            "estimated_gate_crossings": estimated_crossings,
+            "data_quality_rating": rating,
+            "_interpretation": (
+                f"{coverage:.1f}% of frames are real YOLO detections "
+                f"({'confidence ' + str(mean_conf) if mean_conf else 'confidence not recorded'}). "
+                f"Rating: {rating}. "
+                + ("Findings from this window are RELIABLE. " if rating == "HIGH"
+                   else "Treat findings as INDICATIVE — review raw frames. " if rating == "MEDIUM"
+                   else "LOW data quality — DO NOT cite rule violations as confirmed facts. ")
+            ),
+        }
+
+    def insert_reasoning_trace(self, session_id: str, steps: list) -> None:
+        """
+        Persists the agent's investigation steps for a query session to DuckDB.
+
+        Each step records which tool was called, with what arguments, and what
+        the tool returned (truncated to 300 chars). This makes the agent's
+        full reasoning path auditable after the fact — queryable via the
+        get_reasoning_trace tool.
+
+        Args:
+            session_id: UUID string identifying the query session.
+            steps:      List of dicts with keys: step, tool, args, output_excerpt.
+        """
+        import time as _time
+        ts = _time.time()
+        for step in steps:
+            self.conn.execute(
+                "INSERT INTO analysis_sessions VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    int(step.get("step", 0)),
+                    str(step.get("tool", "")),
+                    str(step.get("args", {}))[:500],
+                    str(step.get("output_excerpt", ""))[:300],
+                    ts,
+                ),
+            )
+
+    def get_reasoning_trace(self, session_id: str) -> list:
+        """
+        Retrieves the full investigation trace for a prior query session.
+
+        Args:
+            session_id: UUID returned in the original query response.
+
+        Returns:
+            Ordered list of tool call steps with args and output excerpts.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT step_number, tool_name, input_args, output_excerpt, timestamp_s
+            FROM analysis_sessions
+            WHERE session_id = ?
+            ORDER BY step_number ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        return [
+            {
+                "step": r[0],
+                "tool": r[1],
+                "args": r[2],
+                "output_excerpt": r[3],
+                "recorded_at": r[4],
+            }
+            for r in rows
+        ]
 
     def get_trajectory_path(
         self,

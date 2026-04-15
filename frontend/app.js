@@ -91,6 +91,13 @@ const videoFileInput    = document.getElementById("videoFileInput");
 const videoUploadStatus = document.getElementById("videoUploadStatus");
 const videoUploadLabel  = document.getElementById("videoUploadLabel");
 
+// Single source of truth for video selection — always keeps localStorage in sync.
+function selectVideo(value) {
+    physicsVideoSelect.value = value;
+    runPhysicsBtn.disabled = !value;
+    if (value) localStorage.setItem("trafficagent_video", value);
+}
+
 videoFileInput.addEventListener("change", () => {
     const file = videoFileInput.files[0];
     if (!file) return;
@@ -112,9 +119,7 @@ videoFileInput.addEventListener("change", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
             videoUploadLabel.textContent = `${file.name} saved`;
             loadVideoList().then(() => {
-                // Auto-select the just-uploaded file
-                physicsVideoSelect.value = file.name;
-                runPhysicsBtn.disabled = false;
+                selectVideo(file.name);
             });
             setTimeout(() => { videoUploadStatus.style.display = "none"; }, 3000);
         } else {
@@ -313,14 +318,30 @@ async function loadVideoList() {
             ? `<option value="">Select a video...</option>` +
               data.videos.map(v => `<option value="${v}">${v}</option>`).join("")
             : `<option value="">No videos found</option>`;
-        runPhysicsBtn.disabled = data.videos.length === 0;
+        // Restore previously selected video from localStorage.
+        // Set .value and check if the browser accepted it (non-empty means
+        // the option exists in the list).
+        const saved = localStorage.getItem("trafficagent_video");
+        if (saved) {
+            physicsVideoSelect.value = saved;
+            if (physicsVideoSelect.value === saved) {
+                // Option exists — treat as a real selection
+                runPhysicsBtn.disabled = false;
+            } else {
+                // Saved value no longer in list — clear stale entry
+                localStorage.removeItem("trafficagent_video");
+                runPhysicsBtn.disabled = !physicsVideoSelect.value;
+            }
+        } else {
+            runPhysicsBtn.disabled = !physicsVideoSelect.value;
+        }
     } catch {
         physicsVideoSelect.innerHTML = `<option value="">Could not load videos</option>`;
     }
 }
 
 physicsVideoSelect.addEventListener("change", () => {
-    runPhysicsBtn.disabled = !physicsVideoSelect.value;
+    selectVideo(physicsVideoSelect.value);
 });
 
 runPhysicsBtn.addEventListener("click", async () => {
@@ -403,6 +424,17 @@ function setPhysicsChip(type, text) {
 }
 
 loadVideoList();
+
+// ===== Zone Editor navigation — passes selected video as URL param =====
+const zoneEditorNav = document.getElementById("zoneEditorNav");
+if (zoneEditorNav) {
+    zoneEditorNav.addEventListener("click", (e) => {
+        e.preventDefault();
+        const video = physicsVideoSelect.value;
+        const url = video ? `/zone-ui?video=${encodeURIComponent(video)}` : "/zone-ui";
+        window.location.href = url;
+    });
+}
 
 // ===== Quick Chat (Dashboard) =====
 quickChatForm.addEventListener("submit", async (e) => {

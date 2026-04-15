@@ -66,16 +66,14 @@
     <div>
       <p class="section-title">1 · Video Frame</p>
       <label>Video file</label>
-      <select id="video-select"><option value="">Loading…</option></select>
-      <div style="margin-top:8px">
-        <label>Frame <span id="frame-num">0</span></label>
-        <input type="range" id="frame-slider" min="0" max="100" value="0" step="1">
-        <div class="btn-row" style="margin-top:6px">
-          <button class="btn-ghost" onclick="stepFrame(-30)">-30</button>
-          <button class="btn-ghost" onclick="stepFrame(-1)">-1</button>
-          <button class="btn-ghost" onclick="stepFrame(1)">+1</button>
-          <button class="btn-ghost" onclick="stepFrame(30)">+30</button>
-        </div>
+      <select id="video-select" style="margin-bottom:8px"><option value="">Loading…</option></select>
+      <label>Frame <span id="frame-num">0</span> / <span id="frame-total">—</span></label>
+      <input type="range" id="frame-slider" min="0" max="100" value="0" step="1">
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn-ghost" onclick="stepFrame(-30)">-30</button>
+        <button class="btn-ghost" onclick="stepFrame(-1)">-1</button>
+        <button class="btn-ghost" onclick="stepFrame(1)">+1</button>
+        <button class="btn-ghost" onclick="stepFrame(30)">+30</button>
       </div>
     </div>
 
@@ -96,13 +94,14 @@
     <hr style="border-color:var(--border)">
 
     <div>
-      <p class="section-title">3 · Add Named Gates</p>
+      <p class="section-title">3 · Add Gates</p>
       <p style="color:var(--muted);font-size:12px;margin-bottom:8px">
-        After closing the polygon, click <b>Add Gate</b> then draw a line across an entry/exit.<br>
+        Close the polygon first. Draw a line across each road entry/exit.<br>
         First click = start point, second click = end point.
       </p>
       <div class="btn-row">
-        <button class="btn-primary" onclick="startGate()" id="btn-add-gate" disabled>+ Add Gate</button>
+        <button class="btn-success" onclick="startGate('entry')" id="btn-entry-gate" disabled>+ Entry Gate</button>
+        <button class="btn-danger"  onclick="startGate('exit')"  id="btn-exit-gate"  disabled>+ Exit Gate</button>
       </div>
       <ul class="gate-list" id="gate-list" style="margin-top:10px"></ul>
     </div>
@@ -144,8 +143,9 @@ let imgW = 1, imgH = 1;
 let polygon = [];       // [{x,y}]
 let polygonClosed = false;
 
-let gates = [];         // [{name, p1:{x,y}, p2:{x,y}}]
+let gates = [];         // [{id, type, p1:{x,y}, p2:{x,y}}]
 let pendingGatePt1 = null;  // first point of gate being drawn
+let pendingGateType = 'entry'; // 'entry' | 'exit'
 
 // Mode: 'polygon' | 'gate' | 'idle'
 let mode = 'idle';
@@ -172,27 +172,39 @@ resizeCanvas();
 async function loadVideos() {
   try {
     const r = await fetch('/calibrate/videos');
-    const vids = await r.json();
+    const d = await r.json();
     const sel = document.getElementById('video-select');
-    sel.innerHTML = vids.map(v => `<option value="${v}">${v}</option>`).join('');
-    if (vids.length) await loadFrame();
-  } catch {}
+    if (d.videos && d.videos.length) {
+      sel.innerHTML = '<option value="">Select a video…</option>' +
+        d.videos.map(v => `<option value="${v}">${v}</option>`).join('');
+      // Pre-select from URL param or localStorage
+      const params = new URLSearchParams(window.location.search);
+      const preselect = params.get('video') || localStorage.getItem('trafficagent_video');
+      if (preselect) {
+        sel.value = preselect;
+        if (sel.value === preselect) loadFrame();
+      }
+    } else {
+      sel.innerHTML = '<option value="">No videos found</option>';
+    }
+  } catch(e) { console.error(e); }
 }
 
 async function loadFrame() {
-  const vp  = document.getElementById('video-select').value;
+  const vp = document.getElementById('video-select').value;
+  if (!vp) return;
   const idx = parseInt(document.getElementById('frame-slider').value);
   document.getElementById('frame-num').textContent = idx;
-  if (!vp) return;
   try {
     const r = await fetch(`/calibrate/frame?video_path=${encodeURIComponent(vp)}&frame_idx=${idx}`);
     const d = await r.json();
     totalFrames = d.total_frames - 1;
     document.getElementById('frame-slider').max = totalFrames;
+    document.getElementById('frame-total').textContent = totalFrames;
     imgW = d.width; imgH = d.height;
     const img = new Image();
     img.onload = () => { bgImage = img; redraw(); };
-    img.src = 'data:image/jpeg;base64,' + d.frame_base64;
+    img.src = 'data:image/jpeg;base64,' + d.frame_b64;
   } catch(e) { console.error(e); }
 }
 
@@ -202,11 +214,11 @@ function stepFrame(delta) {
   loadFrame();
 }
 
+document.getElementById('video-select').addEventListener('change', loadFrame);
 document.getElementById('frame-slider').addEventListener('input', () => {
   clearTimeout(frameDebounce);
   frameDebounce = setTimeout(loadFrame, 200);
 });
-document.getElementById('video-select').addEventListener('change', loadFrame);
 
 // ─── Coordinate helpers ───────────────────────────────────────────────────────
 function toPixel(cx, cy) {
@@ -244,9 +256,13 @@ canvas.addEventListener('click', (e) => {
     if (!pendingGatePt1) {
       pendingGatePt1 = {x: px, y: py};
     } else {
-      const name = prompt('Gate name (e.g. North, South, Entry_A):', `Gate ${gates.length + 1}`);
-      if (name) {
-        gates.push({name, p1: pendingGatePt1, p2: {x: px, y: py}});
+      // Auto-ID: E1/E2… for entry, X1/X2… for exit
+      const typePrefix = pendingGateType === 'entry' ? 'E' : 'X';
+      const typeCount = gates.filter(g => g.type === pendingGateType).length + 1;
+      const autoId = `${typePrefix}${typeCount}`;
+      const id = prompt('Gate ID (auto-assigned, edit if needed):', autoId);
+      if (id) {
+        gates.push({id: id.trim(), type: pendingGateType, p1: pendingGatePt1, p2: {x: px, y: py}});
         renderGateList();
         document.getElementById('gate-count-status').textContent = `Gates: ${gates.length}`;
       }
@@ -263,9 +279,10 @@ canvas.addEventListener('dblclick', (e) => {
     polygonClosed = true;
     mode = 'idle';
     setModeLabel('idle');
-    document.getElementById('btn-add-gate').disabled = false;
+    document.getElementById('btn-entry-gate').disabled = false;
+    document.getElementById('btn-exit-gate').disabled = false;
     redraw();
-    toast('Polygon closed. Now add gates.');
+    toast('Polygon closed. Now add entry/exit gates.');
   }
 });
 
@@ -296,7 +313,8 @@ function startPolygon() {
   polygon = [];
   polygonClosed = false;
   mode = 'polygon';
-  document.getElementById('btn-add-gate').disabled = true;
+  document.getElementById('btn-entry-gate').disabled = true;
+  document.getElementById('btn-exit-gate').disabled = true;
   setModeLabel('polygon');
   redraw();
 }
@@ -308,15 +326,17 @@ function clearPolygon() {
   pendingGatePt1 = null;
   mode = 'idle';
   setModeLabel('idle');
-  document.getElementById('btn-add-gate').disabled = true;
+  document.getElementById('btn-entry-gate').disabled = true;
+  document.getElementById('btn-exit-gate').disabled = true;
   document.getElementById('gate-list').innerHTML = '';
   document.getElementById('poly-count').textContent = 'Polygon: 0 pts';
   document.getElementById('gate-count-status').textContent = 'Gates: 0';
   redraw();
 }
 
-function startGate() {
+function startGate(type) {
   if (!polygonClosed) return;
+  pendingGateType = type;
   pendingGatePt1 = null;
   mode = 'gate';
   setModeLabel('gate');
@@ -380,9 +400,12 @@ function redraw() {
 
   // Gates
   gates.forEach((gate, gi) => {
-    const col = GATE_COLOURS[gi % GATE_COLOURS.length];
+    // Entry = green, Exit = red, fallback to palette
+    const col = gate.type === 'entry' ? '#4ade80' : gate.type === 'exit' ? '#f87171' : GATE_COLOURS[gi % GATE_COLOURS.length];
     const {cx: x1, cy: y1} = toCanvas(gate.p1.x, gate.p1.y);
     const {cx: x2, cy: y2} = toCanvas(gate.p2.x, gate.p2.y);
+    const mx = (x1+x2)/2, my = (y1+y2)/2;
+
     ctx.save();
     ctx.strokeStyle = col;
     ctx.lineWidth = 3;
@@ -392,18 +415,10 @@ function redraw() {
     ctx.lineTo(x2, y2);
     ctx.stroke();
 
-    // Arrow showing "enter" direction (normal = CCW of gate vector)
-    const mx = (x1+x2)/2, my = (y1+y2)/2;
-    const gvx = x2-x1, gvy = y2-y1;
-    const len = Math.sqrt(gvx*gvx+gvy*gvy) || 1;
-    const nx = -gvy/len*20, ny = gvx/len*20;
-    ctx.strokeStyle = col; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx+nx, my+ny); ctx.stroke();
-
-    // Label
+    // Label: ID + type tag
     ctx.fillStyle = col;
-    ctx.font = 'bold 12px sans-serif';
-    ctx.fillText(gate.name, mx+nx+4, my+ny-4);
+    ctx.font = 'bold 13px sans-serif';
+    ctx.fillText(`${gate.id} (${gate.type})`, mx + 6, my - 6);
     ctx.restore();
 
     // Endpoints
@@ -428,14 +443,23 @@ function redraw() {
 // ─── Gate list ────────────────────────────────────────────────────────────────
 function renderGateList() {
   const ul = document.getElementById('gate-list');
-  ul.innerHTML = gates.map((g, i) => `
+  ul.innerHTML = gates.map((g, i) => {
+    const col = GATE_COLOURS[i % GATE_COLOURS.length];
+    const badgeStyle = g.type === 'entry'
+      ? 'background:#14532d;color:#4ade80'
+      : 'background:#450a0a;color:#f87171';
+    return `
     <li class="gate-item">
-      <div>
-        <div class="gate-name" style="color:${GATE_COLOURS[i%GATE_COLOURS.length]}">${g.name}</div>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+          <span class="gate-name" style="color:${col}">${g.id}</span>
+          <span style="font-size:10px;font-weight:700;padding:1px 6px;border-radius:8px;${badgeStyle}">${g.type.toUpperCase()}</span>
+        </div>
         <div class="gate-coords">p1=(${g.p1.x.toFixed(0)},${g.p1.y.toFixed(0)}) → p2=(${g.p2.x.toFixed(0)},${g.p2.y.toFixed(0)})</div>
       </div>
       <button class="btn-danger" style="padding:4px 8px;font-size:11px" onclick="removeGate(${i})">✕</button>
-    </li>`).join('');
+    </li>`;
+  }).join('');
   redraw();
 }
 
@@ -455,7 +479,7 @@ async function saveZone() {
   const body = {
     zone_id: zoneId,
     polygon: polygon.map(p => [p.x, p.y]),
-    gates: gates.map(g => ({name: g.name, p1: [g.p1.x, g.p1.y], p2: [g.p2.x, g.p2.y]}))
+    gates: gates.map(g => ({name: g.id, type: g.type, p1: [g.p1.x, g.p1.y], p2: [g.p2.x, g.p2.y]}))
   };
 
   try {
@@ -481,11 +505,14 @@ async function loadExisting() {
     document.getElementById('zone-id').value = d.zone_id || '';
     polygon = (d.polygon || []).map(p => ({x: p[0], y: p[1]}));
     polygonClosed = polygon.length >= 3;
-    gates = (d.gates || []).map(g => ({name: g.name, p1: {x:g.p1[0],y:g.p1[1]}, p2: {x:g.p2[0],y:g.p2[1]}}));
+    gates = (d.gates || []).map(g => ({id: g.name, type: g.type || 'entry', p1: {x:g.p1[0],y:g.p1[1]}, p2: {x:g.p2[0],y:g.p2[1]}}));
     renderGateList();
     document.getElementById('poly-count').textContent = `Polygon: ${polygon.length} pts`;
     document.getElementById('gate-count-status').textContent = `Gates: ${gates.length}`;
-    if (polygonClosed) document.getElementById('btn-add-gate').disabled = false;
+    if (polygonClosed) {
+      document.getElementById('btn-entry-gate').disabled = false;
+      document.getElementById('btn-exit-gate').disabled = false;
+    }
     redraw();
     toast('Existing zone loaded.');
   } catch(e) { toast('Failed to load: ' + e, 'err'); }

@@ -46,6 +46,8 @@ Symbolic: Savitzky-Golay + homography + Kùzu graph + DuckDB + ZoneManager +
           TrafficRuleEngine (explicit, deterministic, auditable rules)
 """
 
+import uuid
+
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_ollama import ChatOllama
@@ -70,6 +72,10 @@ from .tools import (
     get_vehicle_count_report,
     detect_traffic_queue,
     get_turning_movement_counts,
+    get_data_quality_report,
+    explain_threshold,
+    link_violation_to_conflict,
+    get_reasoning_trace,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,6 +99,11 @@ TOOLS_FULL = [
     get_vehicle_count_report,      # Volume / flow rate per time period
     detect_traffic_queue,          # Queue / congestion episode detection
     get_turning_movement_counts,   # Gate-level TMC matrix
+    # --- Explainability tools ---
+    get_data_quality_report,       # Real vs interpolated frames + detection confidence
+    explain_threshold,             # Source standard behind each rule threshold
+    link_violation_to_conflict,    # Write CAUSES edge to Kùzu causal graph
+    get_reasoning_trace,           # Retrieve prior session's tool call audit log
 ]
 TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
@@ -193,8 +204,55 @@ Decision rules:
 - Traffic volume / peak hour: tool 13 directly.
 - Queue / congestion: tool 14 to find episodes, then tool 10 for vehicle positions inside.
 - Turning movements / intersection flow: tool 15 directly.
+16. get_data_quality_report    — ALWAYS call before citing rule violations.
+                                 Returns real vs interpolated frame counts, YOLO confidence,
+                                 gate crossing confidence, and a quality rating (HIGH/MEDIUM/LOW).
+                                 If rating is LOW, state findings as indicative not confirmed.
+
+17. explain_threshold          — Call when the user asks WHY a threshold was chosen.
+                                 Returns the engineering standard / source citation for any rule.
+                                 E.g. "Why is hard braking 4 m/s²?" → explain_threshold("HARD_BRAKING")
+
+18. link_violation_to_conflict — Call AFTER confirm both a violation and a conflict exist
+                                 and you are confident one caused the other.
+                                 Writes a permanent CAUSES edge to the Kùzu graph.
+
+19. get_reasoning_trace        — Call when user asks "how did you reach that conclusion?"
+                                 Retrieves the full tool-call audit log for a prior session.
+
+Decision rules:
+- Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
+- Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5 → 16 (quality check).
+- Relational questions ("which vehicles interacted?"): tools 1 → 3.
+- Combined safety + relationships: tools 1 → 3 → 5.
+- Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
+- Flow/count/OD questions: tool 6 directly.
+- Vehicle-type questions ("behaviour of motorcycles"): tool 7 → tools 4 + 5 per track_id.
+- TTC / conflict severity: tool 8 (proximity) → tool 11 (TTC) for full conflict picture.
+- Speed compliance / V85: tool 12 for all vehicles, then tool 5 per flagged vehicle.
+- Traffic volume / peak hour: tool 13 directly.
+- Queue / congestion: tool 14 to find episodes, then tool 10 for vehicle positions inside.
+- Turning movements / intersection flow: tool 15 directly.
+- Causal attribution ("who caused the accident?"): tools 1→3→5→8→11→18 to write CAUSES edge.
+- "Why this threshold?": tool 17 (explain_threshold).
+- "How did you reach that conclusion?": tool 19 (get_reasoning_trace).
+- Always call tool 16 (get_data_quality_report) before citing evaluate_traffic_rules findings.
 - Always cite the tool output that supports each claim in your final answer.
-- Base your final answer strictly on what the tools returned. Do not invent facts."""
+- Base your final answer strictly on what the tools returned. Do not invent facts.
+
+REQUIRED OUTPUT FORMAT — structure every final answer as follows:
+
+FINDING: [one sentence conclusion]
+EVIDENCE:
+  - [tool name] → [specific value or quote from tool output]
+  - ...
+CONFIDENCE: HIGH | MEDIUM | LOW
+  (HIGH = ≥2 symbolic tools corroborate AND data quality HIGH;
+   MEDIUM = 1 tool or partial data or MEDIUM quality;
+   LOW = VLM-only or LOW quality data)
+ASSUMPTIONS: [list from _assumptions fields in tool outputs, or "None"]
+DATA QUALITY: [coverage_pct% real frames, mean confidence, rating from get_data_quality_report]
+ALTERNATIVE INTERPRETATION: [one plausible alternative if evidence is ambiguous, or "None"]"""
 
 _SYSTEM_PROMPT_SEMANTIC = """You are an expert traffic safety analyst.
 
@@ -371,7 +429,7 @@ def _select_plan(query: str) -> str:
 # LLM — two bindings: full (all 5 tools) and semantic (search only).
 # ChatOllama is required for bind_tools(); OllamaLLM is text-only.
 # ---------------------------------------------------------------------------
-llm = ChatOllama(model="qwen2.5:72b", temperature=0.0)
+llm = ChatOllama(model="gemma4:e2b", temperature=0.0)
 llm_full = llm.bind_tools(TOOLS_FULL)
 llm_semantic = llm.bind_tools(TOOLS_SEMANTIC)
 
@@ -384,8 +442,40 @@ def route_query(state: AgentState) -> AgentState:
     """
     Router node: classifies the query intent using embedding cosine-similarity
     and stores the result in state so all downstream nodes can branch on it.
+    Also generates a unique session_id for reasoning trace persistence.
     """
-    return {"route": _classify_intent(state["query"])}
+    from .hierarchical_router import _classify_intent as _ci_raw
+    query = state["query"]
+    session_id = str(uuid.uuid4())
+
+    # Run the router and capture scores for the routing_explanation field.
+    # _classify_intent already prints scores; we reconstruct the explanation here.
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import cos_sim
+    from .hierarchical_router import (
+        _get_embed_model, _get_proto_embeddings,
+        _FULL_ANALYSIS_PROTOTYPES, _SEMANTIC_LOOKUP_PROTOTYPES,
+    )
+    model = _get_embed_model()
+    protos = _get_proto_embeddings()
+    q_emb = model.encode(query, convert_to_tensor=True)
+    full_score   = float(cos_sim(q_emb, protos["full_analysis"]).max().item())
+    sem_score    = float(cos_sim(q_emb, protos["semantic_lookup"]).max().item())
+    route        = "full_analysis" if full_score >= sem_score else "semantic_lookup"
+    routing_explanation = (
+        f"Routed to {route} "
+        f"(full_analysis score={full_score:.3f}, semantic_lookup score={sem_score:.3f}). "
+        + ("Full physics + rule engine activated." if route == "full_analysis"
+           else "VLM semantic search only — no kinematic tools available.")
+    )
+
+    return {
+        "route": route,
+        "session_id": session_id,
+        "routing_explanation": routing_explanation,
+        "reasoning_steps": [],
+        "contradictions": [],
+    }
 
 
 def planner_node(state: AgentState) -> AgentState:
@@ -448,11 +538,131 @@ def agent_node(state: AgentState) -> AgentState:
 
 def finalize(state: AgentState) -> AgentState:
     """
-    Extracts the last AIMessage content as the final answer.
-    Kept separate so api.py / main.py can still read state['final_summary'].
+    Extracts the last AIMessage, reconstructs the reasoning trace from the
+    message history, persists it to DuckDB, and appends metadata to the summary.
     """
     last = state["messages"][-1]
-    return {"final_summary": last.content}
+    session_id = state.get("session_id", "unknown")
+
+    # --- Extract reasoning trace from message history ---
+    # Match AIMessage tool_calls to their corresponding ToolMessages by tool_call_id.
+    steps: list = []
+    step_num = 0
+    tool_call_id_map: dict = {}   # tool_call_id → step dict
+
+    for msg in state["messages"]:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                step_num += 1
+                step = {
+                    "step": step_num,
+                    "tool": tc["name"],
+                    "args": tc.get("args", {}),
+                    "output_excerpt": "",
+                }
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    tool_call_id_map[tc_id] = step
+                steps.append(step)
+        elif hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            matched = tool_call_id_map.get(msg.tool_call_id)
+            if matched is not None:
+                matched["output_excerpt"] = str(msg.content)[:300]
+
+    # Persist trace to DuckDB
+    try:
+        from .tools import _get_duckdb
+        _get_duckdb().insert_reasoning_trace(session_id, steps)
+    except Exception:
+        pass  # non-fatal — trace persistence is best-effort
+
+    # Append routing and session metadata to summary
+    routing_note = state.get("routing_explanation", "")
+    summary = last.content
+    summary += (
+        f"\n\n---\n"
+        f"[Analysis mode: {state.get('route', 'unknown').upper()}] "
+        f"[Session ID: {session_id}] "
+        f"[Tools called: {step_num}]\n"
+        f"[Routing: {routing_note}]"
+    )
+
+    return {
+        "final_summary": summary,
+        "reasoning_steps": steps,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Contradiction check node — compares VLM (neural) output with rule engine
+# (symbolic) output and flags disagreements in state.
+# ---------------------------------------------------------------------------
+
+_SMOOTH_KEYWORDS = frozenset({
+    "normal", "smooth", "clear", "flowing", "steady",
+    "calm", "typical", "regular", "undisturbed",
+})
+
+
+def contradiction_check(state: AgentState) -> AgentState:
+    """
+    Post-finalize node: scans the message history for neural-symbolic contradictions.
+
+    A contradiction is flagged when:
+      - A semantic tool (search_semantic_events / search_entity_profiles) returned
+        descriptions containing 'normal', 'smooth', 'clear' etc., AND
+      - The rule engine (evaluate_traffic_rules) returned actual violations in
+        the same session.
+
+    If contradictions are found they are appended to final_summary so the
+    user is explicitly warned that the neural and symbolic layers disagreed.
+    """
+    # Map tool_call_id → tool_name from AIMessages
+    tool_call_id_to_name: dict = {}
+    for msg in state["messages"]:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_call_id_to_name[tc.get("id", "")] = tc["name"]
+
+    # Collect tool results by tool name
+    tool_results: dict = {}
+    for msg in state["messages"]:
+        if hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            name = tool_call_id_to_name.get(msg.tool_call_id, "")
+            if name:
+                tool_results.setdefault(name, []).append(str(msg.content))
+
+    semantic_text = " ".join(
+        tool_results.get("search_semantic_events", []) +
+        tool_results.get("search_entity_profiles", [])
+    ).lower()
+
+    rule_text = " ".join(tool_results.get("evaluate_traffic_rules", [])).lower()
+
+    smooth_hits = [w for w in _SMOOTH_KEYWORDS if w in semantic_text]
+    has_violation = (
+        '"violations"' in rule_text
+        and '"violation_count": 0' not in rule_text
+        and "NO_VIOLATIONS" not in rule_text
+    )
+
+    contradictions: list = list(state.get("contradictions") or [])
+    if smooth_hits and has_violation:
+        contradictions.append(
+            f"NEURAL-SYMBOLIC CONTRADICTION: VLM description contains "
+            f"'{', '.join(smooth_hits)}' (suggesting normal traffic) but the "
+            f"symbolic rule engine detected violations. "
+            f"Trust the rule engine — it uses raw kinematics, not visual interpretation. "
+            f"The VLM may have missed the event or described a different time window."
+        )
+
+    # Append contradiction warnings to final_summary if any were found
+    summary = state.get("final_summary", "")
+    if contradictions:
+        warning = "\n\n⚠ CONTRADICTION DETECTED:\n" + "\n".join(f"  • {c}" for c in contradictions)
+        summary = summary + warning
+
+    return {"contradictions": contradictions, "final_summary": summary}
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +691,7 @@ workflow.add_node("initialize", initialize)
 workflow.add_node("agent", agent_node)
 workflow.add_node("tools", tools_node)
 workflow.add_node("finalize", finalize)
+workflow.add_node("contradiction_check", contradiction_check)
 
 workflow.set_entry_point("route_query")
 workflow.add_edge("route_query", "planner")
@@ -493,8 +704,9 @@ workflow.add_conditional_edges(
     {"tools": "tools", "__end__": "finalize"},
 )
 
-workflow.add_edge("tools", "agent")   # observation → next reasoning step
-workflow.add_edge("finalize", END)
+workflow.add_edge("tools", "agent")              # observation → next reasoning step
+workflow.add_edge("finalize", "contradiction_check")
+workflow.add_edge("contradiction_check", END)
 
 # recursion_limit caps the agent ↔ tools loop.
 # 5 tools × worst-case 5 retries = 25; 30 gives a small safety margin.
