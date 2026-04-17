@@ -1,42 +1,36 @@
 """
 VLM inference module for semantic scene abstraction.
 
-Key improvements over single-frame approach (based on 2024-2025 research):
+Replaced Qwen/Qwen2.5-VL-3B-Instruct (HuggingFace) with Gemma 4 E2B
+served through the local Ollama instance — the same backend already
+used by the agentic orchestrator (sequential_pipeline.py).
 
-1. Multi-frame temporal input (Qwen2.5-VL native video format).
-   Passes the last N SoM frames as a video clip using Qwen2.5-VL's
-   MRoPE temporal position encoding. The model sees actual motion,
-   not just a snapshot — capturing approach, conflict, and resolution
-   phases that single-frame sampling misses.
+Architectural benefits of the Ollama path:
+1. Single model server: Ollama manages GPU memory for both the agent LLM
+   and the VLM.  No competing HuggingFace process on the same GPU.
+2. No torch/transformers in this process: cleaner separation of concerns.
+3. Multimodal input via base64 image encoding — Ollama's native format.
+4. Multi-frame temporal context conveyed via per-frame timeline text block
+   (replaces Qwen's MRoPE native video format).
 
-2. Richer output schema.
-   Each triple now includes a `motion_state` field (APPROACHING /
-   DIVERGING / PARALLEL / STATIONARY) and a `phase` field
-   (approach / conflict / resolution / normal). These are validated
-   by EntityExtractor downstream.
-
-3. Chain-of-Thought before JSON.
-   A two-step instruction ("think briefly, then output JSON") reduces
-   hallucination and improves triple quality on dense scenes.
-
-4. max_new_tokens raised to 512.
-   256 was insufficient for complex multi-vehicle scenes where the
-   model needed to describe 5+ interactions.
+Chain-of-Thought + enriched SPO schema are preserved unchanged.
 
 References:
-  - Qwen2.5-VL Technical Report (arXiv 2502.13923)
+  - Gemma 4 Technical Report (google/gemma-4-E2B-it)
   - TrafficVLM temporal phase modelling (arXiv 2404.09275)
   - DriveVLM dual-system architecture (arXiv 2402.12289)
 """
 
+import base64
+import io
 import json
 import logging
 import re
-import torch
-from PIL import Image
 from typing import Any, Dict, List, Optional, Set
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+
+from PIL import Image
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
 
 log = logging.getLogger(__name__)
 
@@ -48,35 +42,43 @@ _MOTION_STATES = {"APPROACHING", "DIVERGING", "PARALLEL", "STATIONARY"}
 # Valid interaction phase labels.
 _PHASES = {"approach", "conflict", "resolution", "normal"}
 
+# Default Ollama model tag — matches the agent LLM in sequential_pipeline.py.
+_DEFAULT_MODEL = "gemma4:e2b"
+
+
+def _pil_to_base64(image: Image.Image) -> str:
+    """
+    Encode a PIL Image as a base64 JPEG string for Ollama multimodal input.
+
+    JPEG at quality=85 balances visual fidelity with token efficiency.
+    SoM badges remain legible at this quality.
+    """
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
 
 class TrafficSemanticAbstractor:
     """
-    Wraps Qwen2.5-VL-3B to perform low-frequency semantic scene abstraction.
+    Wraps Gemma 4 E2B (via local Ollama) to perform low-frequency semantic
+    scene abstraction.
 
     Converts Set-of-Mark (SoM) overlaid frame sequences into structured
     Subject-Predicate-Object triples enriched with motion state and
     interaction phase labels.
 
     Multi-frame mode (preferred):
-        Pass a list of 2–8 consecutive SoM PIL images. The model uses its
-        native video understanding (MRoPE temporal position encoding) to
-        reason about motion trajectories across frames.
+        Pass a list of 2–6 consecutive SoM PIL Images.  All frames are
+        encoded as base64 and sent in a single multimodal message so the
+        model can reason across temporal context.
 
     Single-frame mode (fallback):
-        Pass a list with a single PIL image. Behaviour is identical to the
-        previous single-frame implementation.
+        Pass a list with a single PIL Image.  Behaviour is identical.
     """
 
-    def __init__(self, model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"):
-        log.info("Loading VLM: %s", model_id)
-
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            torch_dtype="auto",
-            device_map="auto",
-        )
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.device = next(self.model.parameters()).device
+    def __init__(self, model_id: str = _DEFAULT_MODEL) -> None:
+        log.info("Connecting to Ollama VLM: %s", model_id)
+        self._llm = ChatOllama(model=model_id, temperature=0.0)
 
     # ------------------------------------------------------------------
     # Physics block helpers
@@ -107,7 +109,10 @@ class TrafficSemanticAbstractor:
                 return f"{lm_dist:.1f}m from {lm_name}"
             x_dir = "E" if x >= 0 else "W"
             y_dir = "N" if y >= 0 else "S"
-            return f"{abs(x):.1f}m {x_dir}, {abs(y):.1f}m {y_dir} of {reference_name}"
+            return (
+                f"{abs(x):.1f}m {x_dir}, {abs(y):.1f}m {y_dir} "
+                f"of {reference_name}"
+            )
 
         lines = []
         for track_id, sv in state_vectors.items():
@@ -156,11 +161,10 @@ class TrafficSemanticAbstractor:
         Generates enriched SPO triples from a sequence of SoM frames.
 
         Args:
-            frame_buffer:     List of 1–8 consecutive SoM PIL Images
-                              (most recent last).  When >1 frame is
-                              provided the model receives them as a
-                              native video input via Qwen2.5-VL's frame-
-                              list format, giving genuine temporal context.
+            frame_buffer:     List of 1–6 consecutive SoM PIL Images
+                              (most recent last).  All frames are base64
+                              encoded and sent together so the model sees
+                              temporal evolution across the clip.
             timestamp:        Video timestamp of the most recent frame (s).
             state_vectors:    Optional {track_id: [x,y,vx,vy,ax,ay]} from
                               KinematicEstimator.
@@ -169,9 +173,10 @@ class TrafficSemanticAbstractor:
             behavior_summary: Change-only motion narrative from DuckDB
                               (last 5 s).  Preferred over state_vectors
                               snapshot when available.
-            fps:              Frame rate of the buffer (VLM sample rate,
-                              typically fps // semantic_interval ≈ 3.0).
-                              Used by Qwen2.5-VL's MRoPE temporal encoding.
+            fps:              Frame rate of the buffer (retained for API
+                              compatibility — not used by Ollama path).
+            zone_context:     Optional dict with 'zone_id' and 'occupant_ids'
+                              for zone-focused analysis.
 
         Returns:
             List of enriched triple dicts:
@@ -203,11 +208,6 @@ class TrafficSemanticAbstractor:
             )
 
         # --- Zone context ----------------------------------------------------
-        # Injected when a zone polygon is active.  Tells the VLM:
-        #   - which zone is highlighted in the video frames
-        #   - which vehicle IDs are currently inside it
-        # The frame already has a spotlight overlay (outside dimmed, border
-        # drawn) so this text reinforces the visual signal.
         zone_block = ""
         if zone_context:
             zid = zone_context.get("zone_id", "")
@@ -215,20 +215,14 @@ class TrafficSemanticAbstractor:
             n = len(occupants)
             zone_block = (
                 f"\n## Zone of Interest: '{zid}'\n"
-                f"The video frames show a highlighted zone (bright border, dimmed exterior). "
-                f"There {'is' if n == 1 else 'are'} currently {n} vehicle{'s' if n != 1 else ''} "
-                f"inside this zone: {occupants}.\n"
-                "Describe ONLY interactions that occur within or at the boundary of this zone. "
+                f"The frames show a highlighted zone (bright border, dimmed exterior). "
+                f"There {'is' if n == 1 else 'are'} currently {n} "
+                f"vehicle{'s' if n != 1 else ''} inside: {occupants}.\n"
+                "Describe ONLY interactions within or at the boundary of this zone. "
                 "Ignore vehicles outside the highlighted area.\n"
             )
 
         # --- ID constraint ---------------------------------------------------
-        # Priority order:
-        # 1. all_active_ids — union of IDs across all frames in the buffer
-        #    (passed by _vlm_worker). This is the most complete list because
-        #    vehicles may appear in earlier frames but not the latest one.
-        # 2. tracked_boxes  — IDs from the current frame only (fallback).
-        # 3. state_vectors  — kinematics keys (last resort).
         if all_active_ids is not None:
             active_ids = sorted(all_active_ids)
         elif tracked_boxes is not None:
@@ -238,15 +232,16 @@ class TrafficSemanticAbstractor:
         else:
             active_ids = []
 
-        # Per-frame presence timeline — tells the VLM exactly which vehicles
-        # existed at each point in the clip so it cannot describe interactions
-        # between vehicles that were never in the same frame.
+        # Per-frame presence timeline — prevents the VLM from describing
+        # interactions between vehicles that were never in the same frame.
         timeline_block = ""
         if frame_id_timeline:
             lines = ["Vehicle presence per frame in this clip:"]
             for i, (ts, ids) in enumerate(frame_id_timeline, 1):
-                marker = " ← current" if i == len(frame_id_timeline) else ""
-                lines.append(f"  Frame {i} (t={ts:.2f}s): Vehicles {ids}{marker}")
+                marker = " <- current" if i == len(frame_id_timeline) else ""
+                lines.append(
+                    f"  Frame {i} (t={ts:.2f}s): Vehicles {ids}{marker}"
+                )
             timeline_block = "\n".join(lines) + "\n"
 
         id_constraint = (
@@ -256,83 +251,76 @@ class TrafficSemanticAbstractor:
         ) if active_ids else ""
 
         # --- System prompt: CoT + richer schema ------------------------------
-        # Two-step instruction: brief internal reasoning → structured JSON.
-        # This reduces hallucination on dense multi-vehicle scenes
-        # (validated by DriveVLM / DriveLM research).
         system_prompt = (
             "You are an expert autonomous driving and traffic safety analyst. "
-            "Analyze the provided traffic camera footage. Vehicles are marked with numerical IDs. "
+            "Analyze the provided traffic camera frames. "
+            "Vehicles are marked with numerical IDs.\n"
             + zone_block
             + id_constraint
             + physics_block
-            + "Step 1 — Think briefly (1–2 sentences) about the most safety-critical interactions. "
-            "Step 2 — Output your analysis STRICTLY as a JSON list of enriched SPO triples. "
-            "Each triple must include:\n"
+            + "Step 1 — Think briefly (1–2 sentences) about the most "
+            "safety-critical interactions.\n"
+            "Step 2 — Output your analysis STRICTLY as a JSON list of "
+            "enriched SPO triples. Each triple must include:\n"
             "  'subject': acting entity (e.g. 'Vehicle 4')\n"
-            "  'predicate': action or spatial relationship (e.g. 'tailgating', 'collided_with')\n"
-            "  'object': receiving entity or environment (e.g. 'Vehicle 9', 'intersection')\n"
-            "  'motion_state': one of APPROACHING / DIVERGING / PARALLEL / STATIONARY\n"
+            "  'predicate': action or spatial relationship "
+            "(e.g. 'tailgating', 'collided_with')\n"
+            "  'object': receiving entity or environment "
+            "(e.g. 'Vehicle 9', 'intersection')\n"
+            "  'motion_state': one of APPROACHING / DIVERGING / "
+            "PARALLEL / STATIONARY\n"
             "  'phase': one of approach / conflict / resolution / normal\n"
-            "Do not include markdown or conversational text outside the JSON array. "
-            "Example: [{'subject':'Vehicle 4','predicate':'tailgating','object':'Vehicle 9',"
-            "'motion_state':'APPROACHING','phase':'conflict'}]"
+            "Do not include markdown or conversational text outside the "
+            "JSON array.\n"
+            "Example: [{\"subject\":\"Vehicle 4\",\"predicate\":\"tailgating\","
+            "\"object\":\"Vehicle 9\","
+            "\"motion_state\":\"APPROACHING\",\"phase\":\"conflict\"}]"
         )
 
-        # --- Build message for Qwen2.5-VL ------------------------------------
-        # Multi-frame path: use native video frame-list format.
-        # Single-frame path: use image format (same behaviour as before).
-        if len(frame_buffer) > 1:
-            visual_content = {
-                "type": "video",
-                "video": frame_buffer,
-                "fps": fps,
-                # Per-frame pixel budget keeps memory predictable.
-                # 256*28*28 ≈ 200k pixels/frame — sufficient for SoM badges.
-                "min_pixels": 16 * 28 * 28,
-                "max_pixels": 256 * 28 * 28,
-            }
-        else:
-            visual_content = {"type": "image", "image": frame_buffer[0]}
+        # --- Build multimodal message -----------------------------------------
+        # Each frame becomes an image_url content block (base64 JPEG).
+        # All frames are sent in a single HumanMessage so the model sees
+        # the full temporal clip before generating triples.
+        content_blocks: List[Dict[str, Any]] = []
+        for frame in frame_buffer:
+            b64 = _pil_to_base64(frame)
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
 
-        messages = [{
-            "role": "user",
-            "content": [
-                visual_content,
-                {"type": "text", "text": system_prompt},
-            ],
-        }]
-
-        # --- Tokenise and run inference --------------------------------------
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        # Brief user-turn instruction to anchor what the model should do
+        # with the images (system prompt carries the full schema instruction).
+        n_frames = len(frame_buffer)
+        frame_label = (
+            f"{n_frames} consecutive traffic frames (oldest to newest)"
+            if n_frames > 1
+            else "1 traffic frame"
         )
-        image_inputs, video_inputs = process_vision_info(messages)
+        content_blocks.append({
+            "type": "text",
+            "text": (
+                f"Analyze the {frame_label} above and output the "
+                "enriched SPO triple list as instructed."
+            ),
+        })
 
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to(self.device)
-
-        with torch.inference_mode():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=512,   # raised from 256: dense scenes need more tokens
-            )
-
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):]
-            for out_ids, in_ids in zip(generated_ids, inputs.input_ids)
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=content_blocks),
         ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
 
-        return self._parse_json_triples(output_text, timestamp)
+        # --- Invoke Ollama ---------------------------------------------------
+        try:
+            response = self._llm.invoke(messages)
+            raw_output = response.content
+        except Exception as exc:
+            log.error(
+                "[VLM] Ollama invocation failed at t=%.1fs: %s", timestamp, exc
+            )
+            return []
+
+        return self._parse_json_triples([raw_output], timestamp)
 
     # ------------------------------------------------------------------
     # JSON parsing
@@ -362,17 +350,26 @@ class TrafficSemanticAbstractor:
         # Layer 2: extract the first [...] array, tolerating CoT preamble
         match = re.search(r"\[.*\]", clean, re.DOTALL)
         if not match:
-            log.warning("[VLM] No JSON array found at t=%.1fs. Raw: %r", timestamp, raw)
+            log.warning(
+                "[VLM] No JSON array found at t=%.1fs. Raw: %r",
+                timestamp, raw,
+            )
             return []
 
         try:
             triples = json.loads(match.group())
         except json.JSONDecodeError as exc:
-            log.warning("[VLM] JSON parse error at t=%.1fs: %s. Raw: %r", timestamp, exc, raw)
+            log.warning(
+                "[VLM] JSON parse error at t=%.1fs: %s. Raw: %r",
+                timestamp, exc, raw,
+            )
             return []
 
         if not isinstance(triples, list):
-            log.warning("[VLM] Expected list, got %s at t=%.1fs.", type(triples), timestamp)
+            log.warning(
+                "[VLM] Expected list, got %s at t=%.1fs.",
+                type(triples), timestamp,
+            )
             return []
 
         valid = []
@@ -388,7 +385,9 @@ class TrafficSemanticAbstractor:
 
             # Layer 5: normalise optional enrichment fields
             ms = str(triple.get("motion_state", "")).upper().strip()
-            triple["motion_state"] = ms if ms in _MOTION_STATES else "APPROACHING"
+            triple["motion_state"] = (
+                ms if ms in _MOTION_STATES else "APPROACHING"
+            )
 
             ph = str(triple.get("phase", "")).lower().strip()
             triple["phase"] = ph if ph in _PHASES else "normal"
@@ -398,6 +397,9 @@ class TrafficSemanticAbstractor:
 
         dropped = len(triples) - len(valid)
         if dropped:
-            log.warning("[VLM] Dropped %d/%d malformed triples at t=%.1fs.", dropped, len(triples), timestamp)
+            log.warning(
+                "[VLM] Dropped %d/%d malformed triples at t=%.1fs.",
+                dropped, len(triples), timestamp,
+            )
 
         return valid

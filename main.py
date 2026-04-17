@@ -59,7 +59,7 @@ def _vlm_worker(
     from src.memory_layer.graph_client import GraphClient
 
     renderer = AdaptiveRenderer()
-    vlm = TrafficSemanticAbstractor(model_id="Qwen/Qwen2.5-VL-3B-Instruct")
+    vlm = TrafficSemanticAbstractor(model_id="gemma4:e2b")
     extractor = EntityExtractor(model_name="qwen2.5:72b")
     milvus_client = SemanticVectorStore()
     graph_client = GraphClient()

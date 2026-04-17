@@ -5,13 +5,11 @@ scipy
 numpy
 PyYAML
 
-transformers
-qwen-vl-utils
-torch
-torchvision
+# transformers, qwen-vl-utils, torch, torchvision, accelerate removed:
+# VLM now routes through Ollama (gemma4:e2b) — no in-process model loading.
+# Keep pillow for SoM frame rendering and base64 encoding.
 pillow
 pydantic
-accelerate 
 
 duckdb
 kuzu
