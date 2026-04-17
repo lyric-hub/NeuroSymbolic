@@ -31,6 +31,7 @@ router = APIRouter(prefix="/zone", tags=["zone"])
 
 class GateModel(BaseModel):
     name: str
+    type: str = "bidirectional"
     p1: Tuple[float, float]
     p2: Tuple[float, float]
 
@@ -39,6 +40,7 @@ class ZoneSaveRequest(BaseModel):
     zone_id: str
     polygon: List[Tuple[float, float]]
     gates: List[GateModel]
+    speed_limit_kmh: float = 50.0
 
 
 class ZoneStatusResponse(BaseModel):
@@ -101,9 +103,10 @@ async def save_zone_config(request: ZoneSaveRequest):
 
     data = {
         "zone_id": request.zone_id.strip(),
+        "speed_limit_kmh": request.speed_limit_kmh,
         "polygon": [list(pt) for pt in request.polygon],
         "gates": [
-            {"name": g.name, "p1": list(g.p1), "p2": list(g.p2)}
+            {"name": g.name, "type": g.type, "p1": list(g.p1), "p2": list(g.p2)}
             for g in request.gates
         ],
     }

@@ -64,6 +64,21 @@
   <div class="panel">
 
     <div>
+      <p class="section-title">0 · Calibration Overlay</p>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:8px">
+        Load named road markers from <code>calibration.yaml</code> to use as
+        visual reference when placing gates.
+      </p>
+      <div class="btn-row">
+        <button class="btn-primary" onclick="loadCalibPoints()">⊕ Load Calibration Points</button>
+        <button class="btn-ghost"  onclick="clearCalibPoints()">Clear</button>
+      </div>
+      <div id="calib-status" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+    </div>
+
+    <hr style="border-color:var(--border)">
+
+    <div>
       <p class="section-title">1 · Video Frame</p>
       <label>Video file</label>
       <select id="video-select" style="margin-bottom:8px"><option value="">Loading…</option></select>
@@ -111,7 +126,9 @@
     <div>
       <p class="section-title">4 · Save</p>
       <label>Zone ID</label>
-      <input type="text" id="zone-id" placeholder="e.g. main_intersection" style="margin-bottom:10px">
+      <input type="text" id="zone-id" placeholder="e.g. main_intersection" style="margin-bottom:8px">
+      <label>Speed limit (km/h)</label>
+      <input type="number" id="speed-limit" value="50" min="1" max="300" step="1" style="margin-bottom:10px">
       <div class="btn-row">
         <button class="btn-success" onclick="saveZone()">💾 Save Zone</button>
         <button class="btn-ghost" onclick="loadExisting()">Load Existing</button>
@@ -139,6 +156,10 @@
 // ─── State ───────────────────────────────────────────────────────────────────
 let bgImage = null;
 let imgW = 1, imgH = 1;
+
+// Calibration landmarks loaded from calibration.yaml via /calibrate/points
+// Each entry: {name, pixel_x, pixel_y, world_x, world_y, is_validation}
+let calibPoints = [];
 
 let polygon = [];       // [{x,y}]
 let polygonClosed = false;
@@ -430,6 +451,28 @@ function redraw() {
     });
   });
 
+  // Calibration landmarks overlay
+  calibPoints.forEach(pt => {
+    const {cx, cy} = toCanvas(pt.pixel_x, pt.pixel_y);
+    const col = pt.is_validation ? '#f59e0b' : '#facc15';
+    ctx.save();
+    // Diamond marker
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = col;
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(-5, -5, 10, 10);
+    ctx.strokeRect(-5, -5, 10, 10);
+    ctx.restore();
+    // Label
+    ctx.save();
+    ctx.fillStyle = col;
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText(pt.name, cx + 8, cy - 4);
+    ctx.restore();
+  });
+
   // Pending gate start point
   if (mode === 'gate' && pendingGatePt1) {
     const {cx, cy} = toCanvas(pendingGatePt1.x, pendingGatePt1.y);
@@ -476,8 +519,10 @@ async function saveZone() {
   if (polygon.length < 3 || !polygonClosed) { toast('Draw and close a polygon first.', 'warn'); return; }
   if (gates.length < 1) { toast('Add at least one gate.', 'warn'); return; }
 
+  const speedLimit = parseFloat(document.getElementById('speed-limit').value) || 50.0;
   const body = {
     zone_id: zoneId,
+    speed_limit_kmh: speedLimit,
     polygon: polygon.map(p => [p.x, p.y]),
     gates: gates.map(g => ({name: g.id, type: g.type, p1: [g.p1.x, g.p1.y], p2: [g.p2.x, g.p2.y]}))
   };
@@ -503,6 +548,7 @@ async function loadExisting() {
     if (!r.ok) { toast('No existing zone found.', 'warn'); return; }
     const d = await r.json();
     document.getElementById('zone-id').value = d.zone_id || '';
+    document.getElementById('speed-limit').value = d.speed_limit_kmh ?? 50;
     polygon = (d.polygon || []).map(p => ({x: p[0], y: p[1]}));
     polygonClosed = polygon.length >= 3;
     gates = (d.gates || []).map(g => ({id: g.name, type: g.type || 'entry', p1: {x:g.p1[0],y:g.p1[1]}, p2: {x:g.p2[0],y:g.p2[1]}}));
@@ -516,6 +562,31 @@ async function loadExisting() {
     redraw();
     toast('Existing zone loaded.');
   } catch(e) { toast('Failed to load: ' + e, 'err'); }
+}
+
+// ─── Calibration overlay ─────────────────────────────────────────────────────
+async function loadCalibPoints() {
+  try {
+    const r = await fetch('/calibrate/points');
+    if (!r.ok) {
+      toast('calibration.yaml not found. Run calibration first.', 'warn');
+      return;
+    }
+    const d = await r.json();
+    calibPoints = d.points || [];
+    document.getElementById('calib-status').textContent =
+      `${calibPoints.length} landmark(s) loaded`;
+    redraw();
+    toast(`Loaded ${calibPoints.length} calibration landmarks.`);
+  } catch(e) {
+    toast('Failed to load calibration points: ' + e, 'err');
+  }
+}
+
+function clearCalibPoints() {
+  calibPoints = [];
+  document.getElementById('calib-status').textContent = '';
+  redraw();
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────

@@ -24,9 +24,11 @@ data/duckdb_storage/
 data/milvus_storage/
 data/graph_storage/
 data/ullooor/
+BrnoCompSpeed
+
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
-# calibration.yaml
+*.yaml
 zone_config.json
 
 # ─── Model weights ────────────────────────────────────────────────────────────

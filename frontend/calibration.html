@@ -330,24 +330,37 @@
         .btn-secondary:hover { border-color: var(--accent); color: var(--text-primary); }
 
         /* ── Results panel ── */
-        .rmse-display {
-            text-align: center;
+        .rmse-row {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
             padding: 10px 0;
+        }
+
+        .rmse-block {
+            flex: 1;
+            text-align: center;
+            padding: 8px 6px;
+            border-radius: var(--radius-xs);
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border-subtle);
         }
 
         .rmse-value {
             font-family: var(--font-mono);
-            font-size: 1.6rem;
+            font-size: 1.3rem;
             font-weight: 600;
         }
         .rmse-good  { color: var(--success); }
         .rmse-ok    { color: var(--warning); }
         .rmse-bad   { color: var(--error); }
+        .rmse-na    { color: var(--text-muted); }
 
         .rmse-label {
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: var(--text-muted);
-            margin-top: 2px;
+            margin-top: 3px;
+            line-height: 1.3;
         }
 
         .error-table {
@@ -367,6 +380,56 @@
             color: var(--text-secondary);
         }
         .error-table td:last-child { text-align: right; }
+        .error-table tr.val-row td { color: var(--warning); }
+        .error-table tr.val-separator td {
+            padding: 2px 5px;
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            border-top: 1px dashed var(--border-subtle);
+            letter-spacing: 0.05em;
+        }
+
+        /* ── Calib vs validation row styling in points table ── */
+        .points-table tr.calib-row td { border-left: 2px solid var(--accent); }
+        .points-table tr.val-row td   { border-left: 2px solid var(--warning); }
+
+        /* ── Calib split selector ── */
+        .split-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+            font-size: 0.82rem;
+            color: var(--text-secondary);
+        }
+        .split-row input[type=number] {
+            width: 52px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-subtle);
+            border-radius: 4px;
+            color: var(--text-primary);
+            padding: 4px 8px;
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            text-align: center;
+            outline: none;
+        }
+        .split-row input[type=number]:focus { border-color: var(--accent); }
+        .split-legend {
+            display: flex;
+            gap: 10px;
+            font-size: 0.73rem;
+            color: var(--text-muted);
+        }
+        .split-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 2px;
+            margin-right: 3px;
+            vertical-align: middle;
+        }
+        .dot-calib { background: var(--accent); }
+        .dot-val   { background: var(--warning); }
 
         /* ── Status badge ── */
         .status-badge {
@@ -518,6 +581,13 @@
             <div id="statusDetail" style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;"></div>
         </div>
 
+        <!-- Load existing calibration -->
+        <div class="panel-card" style="padding:12px 18px;">
+            <h3>Load Existing</h3>
+            <button class="btn-secondary" id="loadExistingBtn">↩ Load calibration.yaml</button>
+            <div id="loadExistingStatus" style="font-size:0.75rem;color:var(--text-muted);margin-top:6px;"></div>
+        </div>
+
         <!-- Method selector -->
         <div class="panel-card">
             <h3>Calibration Method</h3>
@@ -576,15 +646,30 @@
         <!-- Compute -->
         <div class="panel-card">
             <h3>Compute Homography</h3>
-            <button class="btn-primary" id="computeBtn" disabled>Compute &amp; Save</button>
+            <div class="split-row">
+                <span>Use first</span>
+                <input type="number" id="nCalibInput" value="4" min="4" max="20">
+                <span>points to fit H — rest are validation</span>
+            </div>
+            <div class="split-legend">
+                <span><span class="split-dot dot-calib"></span>Calibration</span>
+                <span><span class="split-dot dot-val"></span>Validation (hold-out)</span>
+            </div>
+            <button class="btn-primary" id="computeBtn" disabled style="margin-top:12px;">Compute &amp; Save</button>
         </div>
 
         <!-- Results -->
         <div class="panel-card" id="resultsCard" style="display:none;">
             <h3>Reprojection Results</h3>
-            <div class="rmse-display">
-                <div class="rmse-value" id="rmseValue">—</div>
-                <div class="rmse-label">RMSE (metres)</div>
+            <div class="rmse-row">
+                <div class="rmse-block">
+                    <div class="rmse-value" id="calibRmseValue">—</div>
+                    <div class="rmse-label">Calib RMSE (m)<br><span style="font-size:0.65rem;opacity:0.6;">points used to fit H</span></div>
+                </div>
+                <div class="rmse-block">
+                    <div class="rmse-value" id="valRmseValue">—</div>
+                    <div class="rmse-label">Validation RMSE (m)<br><span style="font-size:0.65rem;opacity:0.6;">held-out — true error</span></div>
+                </div>
             </div>
             <table class="error-table" id="errorTable">
                 <thead>
@@ -630,7 +715,8 @@ const pointCount    = document.getElementById("pointCount");
 const computeBtn    = document.getElementById("computeBtn");
 const clearBtn      = document.getElementById("clearBtn");
 const resultsCard   = document.getElementById("resultsCard");
-const rmseValue     = document.getElementById("rmseValue");
+const calibRmseValue = document.getElementById("calibRmseValue");
+const valRmseValue  = document.getElementById("valRmseValue");
 const errorBody     = document.getElementById("errorBody");
 const statusBadge   = document.getElementById("statusBadge");
 const statusText    = document.getElementById("statusText");
@@ -646,6 +732,9 @@ const col3Head      = document.getElementById("col3Head");
 const col4Head      = document.getElementById("col4Head");
 const hintDirect    = document.getElementById("hintDirect");
 const hintGE        = document.getElementById("hintGE");
+const nCalibInput        = document.getElementById("nCalibInput");
+const loadExistingBtn    = document.getElementById("loadExistingBtn");
+const loadExistingStatus = document.getElementById("loadExistingStatus");
 
 // ═══════════════════════════════════════════════════════════
 // Toast
@@ -913,6 +1002,13 @@ canvas.addEventListener("click", (e) => {
 // ═══════════════════════════════════════════════════════════
 // Points table
 // ═══════════════════════════════════════════════════════════
+function getNCalib() {
+    return Math.max(4, parseInt(nCalibInput.value) || 4);
+}
+
+// Re-render table when n_calib changes so colour coding updates live.
+nCalibInput.addEventListener("input", renderTable);
+
 function renderTable() {
     pointCount.textContent = `(${state.points.length})`;
     computeBtn.disabled = state.points.length < 4;
@@ -924,9 +1020,11 @@ function renderTable() {
         return;
     }
 
+    const nCalib = getNCalib();
+
     if (state.mode === "direct") {
         pointsBody.innerHTML = state.points.map((pt, i) => `
-            <tr>
+            <tr class="${i < nCalib ? "calib-row" : "val-row"}">
                 <td class="point-idx">${i + 1}</td>
                 <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
                 <td>
@@ -949,7 +1047,7 @@ function renderTable() {
         `).join("");
     } else {
         pointsBody.innerHTML = state.points.map((pt, i) => `
-            <tr>
+            <tr class="${i < nCalib ? "calib-row" : "val-row"}">
                 <td class="point-idx">${i + 1}</td>
                 <td class="coord-cell">${Math.round(pt.pixelX)}, ${Math.round(pt.pixelY)}</td>
                 <td>
@@ -1038,9 +1136,10 @@ computeBtn.addEventListener("click", async () => {
     computeBtn.textContent = "Computing...";
 
     const payload = {
-        video_path:  state.videoFile,
-        frame_idx:   state.frameIdx,
-        point_pairs: pointPairs,
+        video_path:     state.videoFile,
+        frame_idx:      state.frameIdx,
+        point_pairs:    pointPairs,
+        n_calib_points: getNCalib(),
     };
 
     try {
@@ -1053,25 +1152,48 @@ computeBtn.addEventListener("click", async () => {
         if (!res.ok) { toast(data.detail || "Compute failed.", "error"); return; }
 
         resultsCard.style.display = "block";
-        const rmse = data.rmse;
-        rmseValue.textContent = rmse.toFixed(4);
-        rmseValue.className = `rmse-value ${rmse < 0.3 ? "rmse-good" : rmse < 0.8 ? "rmse-ok" : "rmse-bad"}`;
 
-        errorBody.innerHTML = data.point_errors.map(e => `
-            <tr>
-                <td>${e.index + 1}</td>
-                <td>${e.projected_x.toFixed(2)}</td>
-                <td>${e.projected_y.toFixed(2)}</td>
-                <td style="color:${e.error_px < 0.3 ? "var(--success)" : e.error_px < 0.8 ? "var(--warning)" : "var(--error)"}">
-                    ${e.error_px.toFixed(4)}
-                </td>
-            </tr>
-        `).join("");
+        // Calib RMSE — always present, typically near 0 (expected).
+        const cRmse = data.calib_rmse;
+        calibRmseValue.textContent = cRmse.toFixed(4);
+        calibRmseValue.className = "rmse-value rmse-na";  // grey — not a meaningful metric
+
+        // Validation RMSE — only meaningful when hold-out points exist.
+        const vRmse = data.validation_rmse;
+        const hasVal = data.n_validation > 0;
+        valRmseValue.textContent = hasVal ? vRmse.toFixed(4) : "—";
+        valRmseValue.className = hasVal
+            ? `rmse-value ${vRmse < 0.3 ? "rmse-good" : vRmse < 0.8 ? "rmse-ok" : "rmse-bad"}`
+            : "rmse-value rmse-na";
+
+        // Error table — calib rows, separator, then validation rows.
+        const nCalib = data.n_calib;
+        let rows = "";
+        data.point_errors.forEach((e, idx) => {
+            if (e.is_validation && idx > 0 && !data.point_errors[idx - 1].is_validation) {
+                rows += `<tr class="val-separator"><td colspan="4">▼ Validation (hold-out)</td></tr>`;
+            }
+            const rowClass = e.is_validation ? "val-row" : "";
+            const errColor = e.error_px < 0.3
+                ? "var(--success)" : e.error_px < 0.8
+                ? "var(--warning)" : "var(--error)";
+            rows += `
+                <tr class="${rowClass}">
+                    <td>${e.index + 1}${e.is_validation ? " ✦" : ""}</td>
+                    <td>${e.projected_x.toFixed(2)}</td>
+                    <td>${e.projected_y.toFixed(2)}</td>
+                    <td style="color:${errColor}">${e.error_px.toFixed(4)}</td>
+                </tr>`;
+        });
+        errorBody.innerHTML = rows;
 
         state.projectedPts = [];
 
         const modeLabel = state.mode === "gearth" ? " (Google Earth)" : "";
-        toast(`Saved! RMSE = ${rmse.toFixed(4)} m${modeLabel}`, "success");
+        const summary = hasVal
+            ? `Val RMSE = ${vRmse.toFixed(4)} m`
+            : `Calib RMSE = ${cRmse.toFixed(4)} m (no hold-out)`;
+        toast(`Saved! ${summary}${modeLabel}`, "success");
         await loadStatus();
 
     } catch (err) {
@@ -1138,6 +1260,83 @@ clearBtn.addEventListener("click", () => {
     renderTable();
     redraw();
 });
+
+// ═══════════════════════════════════════════════════════════
+// Load existing calibration.yaml
+// ═══════════════════════════════════════════════════════════
+loadExistingBtn.addEventListener("click", loadExistingCalibration);
+
+async function loadExistingCalibration() {
+    loadExistingBtn.disabled = true;
+    loadExistingBtn.textContent = "Loading…";
+    try {
+        // 1. Get video_path and frame_idx from calibration status
+        const statusRes = await fetch("/calibrate/status");
+        const statusData = await statusRes.json();
+        if (!statusData.calibrated) {
+            toast("No calibration.yaml found. Run calibration first.", "error");
+            return;
+        }
+
+        // 2. Get named points with pixel coordinates
+        const ptsRes = await fetch("/calibrate/points");
+        if (!ptsRes.ok) {
+            toast("Failed to load calibration points.", "error");
+            return;
+        }
+        const ptsData = await ptsRes.json();
+
+        const { video_path, frame_idx } = statusData.detail;
+
+        // 3. Set video selector — add option if path not already present
+        if (!Array.from(videoSelect.options).some(o => o.value === video_path)) {
+            const opt = document.createElement("option");
+            opt.value = video_path;
+            opt.textContent = video_path;
+            videoSelect.appendChild(opt);
+        }
+        videoSelect.value = video_path;
+        state.videoFile = video_path;
+        scrubber.disabled = false;
+
+        // 4. Load the correct frame
+        await loadFrame(frame_idx ?? 0);
+
+        // 5. Populate state.points — calib first, then validation
+        const calibPts = ptsData.points.filter(p => !p.is_validation);
+        const valPts   = ptsData.points.filter(p =>  p.is_validation);
+
+        state.points = [...calibPts, ...valPts].map(p => ({
+            pixelX: p.pixel_x,
+            pixelY: p.pixel_y,
+            worldX: p.world_x,
+            worldY: p.world_y,
+            lat: "",
+            lon: "",
+            name: p.name || "",
+        }));
+
+        // 6. Restore calibration split
+        nCalibInput.value = Math.max(4, calibPts.length);
+
+        state.projectedPts = [];
+        renderTable();
+        redraw();
+
+        loadExistingStatus.textContent =
+            `${state.points.length} pts loaded (${calibPts.length} calib + ${valPts.length} val)`;
+        toast(
+            `Loaded ${state.points.length} points from calibration.yaml — edit and recompute as needed.`,
+            "success"
+        );
+
+    } catch (err) {
+        toast("Error loading calibration: " + err, "error");
+    } finally {
+        loadExistingBtn.disabled = false;
+        loadExistingBtn.textContent = "↩ Load calibration.yaml";
+    }
+}
 
 // ═══════════════════════════════════════════════════════════
 // Boot

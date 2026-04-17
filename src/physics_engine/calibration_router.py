@@ -54,6 +54,7 @@ class ComputeRequest(BaseModel):
     video_path: str
     frame_idx: int
     point_pairs: List[PointPair]
+    n_calib_points: int = 4  # first N points used to fit H; remainder are validation
 
 
 class PointError(BaseModel):
@@ -64,12 +65,16 @@ class PointError(BaseModel):
     projected_x: float
     projected_y: float
     error_px: float
+    is_validation: bool = False  # True for hold-out points not used to fit H
 
 
 class ComputeResponse(BaseModel):
     """Full response from /calibrate/compute."""
-    rmse: float
-    point_errors: List[PointError]
+    calib_rmse: float        # reprojection error on the points used to fit H
+    validation_rmse: float   # reprojection error on the held-out points (0 if none)
+    n_calib: int
+    n_validation: int
+    point_errors: List[PointError]   # all points — calib first, then validation
     saved_to: str
 
 
@@ -113,10 +118,20 @@ def _compute_reprojection_errors(
     image_pts: np.ndarray,
     world_pts: np.ndarray,
     H: np.ndarray,
+    index_offset: int = 0,
+    is_validation: bool = False,
 ) -> list[PointError]:
     """
     Projects each image point through H and computes the Euclidean distance
     to the corresponding known world point (in world-coordinate space).
+
+    Args:
+        image_pts: Shape (N, 2) pixel coordinates.
+        world_pts: Shape (N, 2) ground-plane world coordinates (metres).
+        H: 3×3 homography matrix.
+        index_offset: Added to each point's index field (used to give
+            validation points indices that continue after calibration points).
+        is_validation: Whether these points were held out (not used to fit H).
     """
     errors = []
     for i, (img_pt, world_pt) in enumerate(zip(image_pts, world_pts)):
@@ -126,12 +141,13 @@ def _compute_reprojection_errors(
         error = float(np.linalg.norm(projected - world_pt))
         errors.append(
             PointError(
-                index=i,
+                index=index_offset + i,
                 pixel_x=float(img_pt[0]),
                 pixel_y=float(img_pt[1]),
                 projected_x=float(projected[0]),
                 projected_y=float(projected[1]),
                 error_px=round(error, 4),
+                is_validation=is_validation,
             )
         )
     return errors
@@ -180,36 +196,57 @@ def get_frame(
 @router.post("/compute", response_model=ComputeResponse)
 def compute_homography(request: ComputeRequest) -> ComputeResponse:
     """
-    Computes the homography matrix from the provided pixel ↔ world point pairs,
-    saves the result to calibration.yaml, and returns per-point reprojection
-    errors so the user can evaluate calibration quality.
+    Computes the homography matrix from the first ``n_calib_points`` pairs,
+    then evaluates reprojection error on any remaining (held-out) points.
 
-    Requires at least 4 point pairs (minimum for a valid homography).
+    The split makes the validation RMSE a true out-of-sample error estimate:
+    calibration points always reproject near-perfectly because H was fit to
+    them, so only held-out points reveal real calibration quality.
+
+    Requires at least 4 calibration point pairs (minimum for a valid homography).
+    Requires n_calib_points ≤ len(point_pairs).
     """
-    if len(request.point_pairs) < 4:
+    n_calib = max(4, request.n_calib_points)
+    if len(request.point_pairs) < n_calib:
         raise HTTPException(
             status_code=422,
-            detail="At least 4 point pairs are required to compute a homography.",
+            detail=f"Need at least {n_calib} point pairs to compute a homography "
+                   f"(received {len(request.point_pairs)}).",
         )
 
-    image_pts = np.array(
-        [[p.pixel_x, p.pixel_y] for p in request.point_pairs], dtype=np.float32
-    )
-    world_pts = np.array(
-        [[p.world_x, p.world_y] for p in request.point_pairs], dtype=np.float32
-    )
+    calib_pairs = request.point_pairs[:n_calib]
+    val_pairs   = request.point_pairs[n_calib:]
 
-    H, mask = cv2.findHomography(image_pts, world_pts, method=cv2.RANSAC)
+    calib_img = np.array([[p.pixel_x, p.pixel_y] for p in calib_pairs], dtype=np.float32)
+    calib_wld = np.array([[p.world_x, p.world_y] for p in calib_pairs], dtype=np.float32)
+
+    H, _ = cv2.findHomography(calib_img, calib_wld, method=0)
     if H is None:
         raise HTTPException(
             status_code=422,
-            detail="Homography computation failed. Check that points are not collinear.",
+            detail="Homography computation failed. Check that the calibration "
+                   "points are not collinear.",
         )
 
-    point_errors = _compute_reprojection_errors(image_pts, world_pts, H)
-    rmse = float(np.sqrt(np.mean([e.error_px ** 2 for e in point_errors])))
+    # Reprojection errors — calib points first, then validation hold-outs.
+    calib_errors = _compute_reprojection_errors(
+        calib_img, calib_wld, H, index_offset=0, is_validation=False
+    )
+    calib_rmse = float(np.sqrt(np.mean([e.error_px ** 2 for e in calib_errors])))
 
-    # Build named_points list — every point pair with its user-assigned name.
+    val_errors: list[PointError] = []
+    validation_rmse = 0.0
+    if val_pairs:
+        val_img = np.array([[p.pixel_x, p.pixel_y] for p in val_pairs], dtype=np.float32)
+        val_wld = np.array([[p.world_x, p.world_y] for p in val_pairs], dtype=np.float32)
+        val_errors = _compute_reprojection_errors(
+            val_img, val_wld, H, index_offset=n_calib, is_validation=True
+        )
+        validation_rmse = float(np.sqrt(np.mean([e.error_px ** 2 for e in val_errors])))
+
+    all_errors = calib_errors + val_errors
+
+    # named_points — include ALL points (calibration + validation).
     # Fallback name is "Point N" for any point left unnamed.
     named_points = [
         {
@@ -220,8 +257,7 @@ def compute_homography(request: ComputeRequest) -> ComputeResponse:
         for i, p in enumerate(request.point_pairs)
     ]
 
-    # The reference point is whichever named point sits at (0, 0).
-    # If none is exactly at origin, fall back to the first point.
+    # Reference point: named point at origin (0, 0), else first calib point.
     ref = next(
         (p for p in named_points if p["world_x"] == 0.0 and p["world_y"] == 0.0),
         named_points[0],
@@ -229,11 +265,11 @@ def compute_homography(request: ComputeRequest) -> ComputeResponse:
 
     calibration_data = {
         "homography": H.tolist(),
-        "image_points": image_pts.tolist(),
-        "world_points": world_pts.tolist(),
+        "image_points": calib_img.tolist(),
+        "world_points": calib_wld.tolist(),
         "video_path": request.video_path,
         "frame_idx": request.frame_idx,
-        "rmse_meters": round(rmse, 4),
+        "rmse_meters": round(calib_rmse, 4),
         "named_points": named_points,
         "reference_point": {
             "name": ref["name"],
@@ -241,14 +277,85 @@ def compute_homography(request: ComputeRequest) -> ComputeResponse:
             "world_y": ref["world_y"],
         },
     }
+
+    if val_pairs:
+        val_img_list = [[p.pixel_x, p.pixel_y] for p in val_pairs]
+        val_wld_list = [[p.world_x, p.world_y] for p in val_pairs]
+        calibration_data["validation_image_points"] = val_img_list
+        calibration_data["validation_world_points"] = val_wld_list
+        calibration_data["validation_rmse_meters"] = round(validation_rmse, 4)
+
     with open(CALIBRATION_FILE, "w") as f:
         yaml.dump(calibration_data, f)
 
     return ComputeResponse(
-        rmse=round(rmse, 4),
-        point_errors=point_errors,
+        calib_rmse=round(calib_rmse, 4),
+        validation_rmse=round(validation_rmse, 4),
+        n_calib=n_calib,
+        n_validation=len(val_pairs),
+        point_errors=all_errors,
         saved_to=str(CALIBRATION_FILE.resolve()),
     )
+
+
+@router.get("/points")
+def get_calibration_points() -> JSONResponse:
+    """
+    Returns all named calibration landmarks with their pixel coordinates,
+    read from calibration.yaml.  Used by the zone editor to overlay known
+    road markers on the canvas so gates can be aligned precisely.
+
+    Response shape::
+
+        {
+          "points": [
+            {"name": "C4", "pixel_x": 616.1, "pixel_y": 810.7,
+             "world_x": 0.0, "world_y": 0.0, "is_validation": false},
+            ...
+          ]
+        }
+    """
+    if not CALIBRATION_FILE.exists():
+        raise HTTPException(status_code=404, detail="calibration.yaml not found.")
+
+    with open(CALIBRATION_FILE) as f:
+        data = yaml.safe_load(f)
+
+    # Build world-coordinate → name lookup from named_points list.
+    name_lookup: dict[tuple[float, float], str] = {}
+    for entry in data.get("named_points", []):
+        key = (round(float(entry["world_x"]), 3), round(float(entry["world_y"]), 3))
+        name_lookup[key] = entry["name"]
+
+    points = []
+
+    img_pts = data.get("image_points", [])
+    wld_pts = data.get("world_points", [])
+    for img, wld in zip(img_pts, wld_pts):
+        key = (round(float(wld[0]), 3), round(float(wld[1]), 3))
+        points.append({
+            "name": name_lookup.get(key, f"({wld[0]:.1f},{wld[1]:.1f})"),
+            "pixel_x": float(img[0]),
+            "pixel_y": float(img[1]),
+            "world_x": float(wld[0]),
+            "world_y": float(wld[1]),
+            "is_validation": False,
+        })
+
+    val_img_pts = data.get("validation_image_points", [])
+    val_wld_pts = data.get("validation_world_points", [])
+    for img, wld in zip(val_img_pts, val_wld_pts):
+        key = (round(float(wld[0]), 3), round(float(wld[1]), 3))
+        points.append({
+            "name": name_lookup.get(key, f"({wld[0]:.1f},{wld[1]:.1f})"),
+            "pixel_x": float(img[0]),
+            "pixel_y": float(img[1]),
+            "world_x": float(wld[0]),
+            "world_y": float(wld[1]),
+            "is_validation": True,
+        })
+
+    return JSONResponse({"points": points})
 
 
 @router.get("/status")
