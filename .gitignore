@@ -24,7 +24,8 @@ data/duckdb_storage/
 data/milvus_storage/
 data/graph_storage/
 data/ullooor/
-BrnoCompSpeed
+# BrnoCompSpeed/results/
+BrnoCompSpeed/session6_center/video.avi
 
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
