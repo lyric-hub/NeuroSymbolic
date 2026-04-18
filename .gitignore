@@ -29,7 +29,7 @@ BrnoCompSpeed
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
 *.yaml
-zone_config.json
+# zone_config.json
 
 # ─── Model weights ────────────────────────────────────────────────────────────
 # *.pt
