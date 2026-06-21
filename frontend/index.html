@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TrafficAgent — AI Command Center</title>
-    <meta name="description" content="Neuro-Symbolic Traffic Analytics powered by multi-hop Graph-RAG reasoning">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -32,9 +31,18 @@
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
                 <span>Dashboard</span>
             </a>
+            <a href="#" class="nav-item" data-view="demo">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                <span>Scenario Demo</span>
+            </a>
             <a href="#" class="nav-item" data-view="chat">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                 <span>Agent Chat</span>
+            </a>
+            <a href="#" class="nav-item" data-view="alerts">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                <span>Live Alerts</span>
+                <span class="alert-badge" id="alertBadge" style="display:none">0</span>
             </a>
             <a href="/calibrate-ui" class="nav-item">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M8.46 8.46a5 5 0 0 0 0 7.07"/></svg>
@@ -74,29 +82,71 @@
         <!-- ===== Dashboard View ===== -->
         <section class="view active" id="dashboardView">
 
-            <!-- Model Upload Card -->
+            <!-- Memory Stats Row -->
+            <div class="stats-row">
+                <div class="stat-card">
+                    <div class="stat-icon duckdb-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="statDuckdb">—</div>
+                        <div class="stat-label">DuckDB rows</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon milvus-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="statMilvus">—</div>
+                        <div class="stat-label">Milvus events</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon kuzu-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><line x1="7" y1="11" x2="17" y2="6"/><line x1="7" y1="13" x2="17" y2="18"/></svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="statKuzu">—</div>
+                        <div class="stat-label">Graph edges</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon profiles-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="statProfiles">—</div>
+                        <div class="stat-label">Entity profiles</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Detection Model Card -->
             <div class="card model-card">
                 <div class="card-header">
                     <h2>Detection Model</h2>
                     <div class="chip" id="modelStatusChip">Idle</div>
                 </div>
-                <div class="model-active" id="modelActiveLine">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-                    <span id="activeModelName">Loading...</span>
-                </div>
-                <div class="model-upload-row">
-                    <label class="model-upload-btn" for="modelFileInput">
-                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                        Upload .pt
-                    </label>
-                    <input type="file" id="modelFileInput" accept=".pt" hidden>
-                    <span class="model-upload-hint" id="modelUploadHint">Drop a YOLO .pt weights file</span>
-                </div>
-                <div class="model-progress" id="modelProgress" style="display:none;">
-                    <div class="progress-bar-track">
-                        <div class="progress-bar-fill" id="modelProgressFill"></div>
+                <div class="card-body">
+                    <div class="model-active" id="modelActiveLine">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                        <span id="activeModelName">Loading...</span>
                     </div>
-                    <span class="progress-frames" id="modelProgressLabel">Uploading...</span>
+                    <div class="model-upload-row">
+                        <label class="model-upload-btn" for="modelFileInput">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            Upload .pt
+                        </label>
+                        <input type="file" id="modelFileInput" accept=".pt" hidden>
+                        <span class="model-upload-hint" id="modelUploadHint">Drop a YOLO .pt weights file</span>
+                    </div>
+                    <div class="model-progress" id="modelProgress" style="display:none;">
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="modelProgressFill"></div>
+                        </div>
+                        <span class="progress-frames" id="modelProgressLabel">Uploading...</span>
+                    </div>
                 </div>
             </div>
 
@@ -106,41 +156,43 @@
                     <h2>Run Physics Pipeline</h2>
                     <div class="chip" id="physicsStatusChip">Idle</div>
                 </div>
-                <div class="physics-form">
-                    <select id="physicsVideoSelect" class="video-select">
-                        <option value="">Select a video...</option>
-                    </select>
-                    <label class="upload-video-btn" for="videoFileInput" title="Upload a new video">
-                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                    </label>
-                    <input type="file" id="videoFileInput" accept=".mp4,.avi,.mov" hidden>
-                    <button id="runPhysicsBtn" class="run-btn" disabled>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                        Run Pipeline
-                    </button>
-                </div>
-                <div class="video-upload-status" id="videoUploadStatus" style="display:none;">
-                    <span id="videoUploadLabel"></span>
-                </div>
-                <div class="pipeline-options">
-                    <label class="option-label">
-                        <input type="checkbox" id="chkPhysics" checked>
-                        <span>Physics <small>(kinematics + DuckDB)</small></span>
-                    </label>
-                    <label class="option-label">
-                        <input type="checkbox" id="chkVlm" checked>
-                        <span>VLM <small>(semantic abstraction)</small></span>
-                    </label>
-                </div>
-                <div class="physics-progress" id="physicsProgress" style="display:none;">
-                    <div class="progress-bar-track">
-                        <div class="progress-bar-fill" id="physicsProgressFill"></div>
+                <div class="card-body">
+                    <div class="physics-form">
+                        <select id="physicsVideoSelect" class="video-select">
+                            <option value="">Select a video...</option>
+                        </select>
+                        <label class="upload-video-btn" for="videoFileInput" title="Upload a new video">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        </label>
+                        <input type="file" id="videoFileInput" accept=".mp4,.avi,.mov" hidden>
+                        <button id="runPhysicsBtn" class="run-btn" disabled>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                            Run Pipeline
+                        </button>
                     </div>
-                    <span class="progress-frames" id="physicsProgressLabel">0 / ? frames</span>
+                    <div class="video-upload-status" id="videoUploadStatus" style="display:none;">
+                        <span id="videoUploadLabel"></span>
+                    </div>
+                    <div class="pipeline-options">
+                        <label class="option-label">
+                            <input type="checkbox" id="chkPhysics" checked>
+                            <span>Physics <small>(kinematics + DuckDB)</small></span>
+                        </label>
+                        <label class="option-label">
+                            <input type="checkbox" id="chkVlm" checked>
+                            <span>VLM <small>(semantic abstraction)</small></span>
+                        </label>
+                    </div>
+                    <div class="physics-progress" id="physicsProgress" style="display:none;">
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="physicsProgressFill"></div>
+                        </div>
+                        <span class="progress-frames" id="physicsProgressLabel">0 / ? frames</span>
+                    </div>
                 </div>
             </div>
 
-            <!-- Quick Chat Card (Preview) -->
+            <!-- Quick Chat Card -->
             <div class="card chat-preview-card">
                 <div class="card-header">
                     <h2>Quick Query</h2>
@@ -157,9 +209,94 @@
 
         </section>
 
+        <!-- ===== Scenario Demo View ===== -->
+        <section class="view" id="demoView">
+            <div class="demo-layout">
+
+                <!-- Left: Scenario panel -->
+                <div class="demo-sidebar">
+                    <div class="demo-scenario-header">
+                        <h2>Scenario Queries</h2>
+                        <p class="demo-subtitle">Pre-loaded from simulated dataset. Click to run.</p>
+                    </div>
+
+                    <div class="demo-category" id="demoCategoryAccident">
+                        <div class="demo-category-label">Accident Reconstruction</div>
+                        <button class="demo-query-btn" data-query="What caused the accident?">What caused the accident?</button>
+                        <button class="demo-query-btn" data-query="Was there a collision between any vehicles?">Was there a collision?</button>
+                        <button class="demo-query-btn" data-query="Why did the near-miss occur between V9 and V11?">Near-miss between V9 and V11?</button>
+                    </div>
+
+                    <div class="demo-category">
+                        <div class="demo-category-label">Behavioral Profiling</div>
+                        <button class="demo-query-btn" data-query="Which vehicle was most aggressive throughout the video?">Most aggressive vehicle?</button>
+                        <button class="demo-query-btn" data-query="Find the most dangerous driver.">Most dangerous driver?</button>
+                        <button class="demo-query-btn" data-query="Which vehicle hard-braked the most?">Hard braking analysis</button>
+                    </div>
+
+                    <div class="demo-category">
+                        <div class="demo-category-label">Speed Compliance</div>
+                        <button class="demo-query-btn" data-query="Which vehicles were speeding?">Which vehicles were speeding?</button>
+                        <button class="demo-query-btn" data-query="What is the 85th percentile speed of vehicles on this road?">V85 design speed?</button>
+                        <button class="demo-query-btn" data-query="Are vehicles generally complying with the speed limit?">Speed compliance check</button>
+                    </div>
+
+                    <div class="demo-category">
+                        <div class="demo-category-label">Conflict Analysis</div>
+                        <button class="demo-query-btn" data-query="Was there a critical TTC conflict in the video?">Critical TTC conflict?</button>
+                        <button class="demo-query-btn" data-query="Were any vehicles tailgating?">Tailgating detection</button>
+                        <button class="demo-query-btn" data-query="How close did V8 get to V7?">V8 proximity to V7</button>
+                    </div>
+
+                    <div class="demo-category">
+                        <div class="demo-category-label">Explainability</div>
+                        <button class="demo-query-btn" data-query="Why is the hard braking threshold set to 3 m/s²?">Why 3 m/s² threshold?</button>
+                        <button class="demo-query-btn" data-query="Which vehicle caused the accident — link the violation to the conflict?">Violation → conflict causal link</button>
+                        <button class="demo-query-btn" data-query="What is the data quality for V4 trajectory?">V4 data quality report</button>
+                    </div>
+
+                    <div class="demo-category">
+                        <div class="demo-category-label">Traffic Flow</div>
+                        <button class="demo-query-btn" data-query="How many vehicles were active in the 60-second normal scenario?">Vehicle count — normal scenario</button>
+                        <button class="demo-query-btn" data-query="Was there a traffic queue or congestion?">Congestion / queue check</button>
+                        <button class="demo-query-btn" data-query="What traffic violations did trucks commit?">Truck violations</button>
+                    </div>
+                </div>
+
+                <!-- Right: Result panel -->
+                <div class="demo-result-panel">
+                    <div class="demo-result-header">
+                        <div class="demo-query-display" id="demoQueryDisplay">
+                            Select a query from the left panel to begin.
+                        </div>
+                        <div class="chip" id="demoStatusChip">Ready</div>
+                    </div>
+
+                    <!-- Tool trace -->
+                    <div class="tool-trace" id="toolTrace" style="display:none;">
+                        <div class="tool-trace-header">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                            Reasoning Trace
+                        </div>
+                        <div class="tool-steps" id="toolSteps"></div>
+                    </div>
+
+                    <!-- Answer -->
+                    <div class="demo-answer-box" id="demoAnswerBox">
+                        <div class="demo-answer-placeholder">
+                            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3">
+                                <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+                            </svg>
+                            <p>Agent response will appear here.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
         <!-- ===== Chat View ===== -->
         <section class="view" id="chatView">
-            <div class="chat-container">
+            <div class="chat-layout">
                 <div class="chat-messages" id="chatMessages">
                     <div class="chat-welcome">
                         <div class="welcome-icon">
@@ -170,11 +307,12 @@
                             </svg>
                         </div>
                         <h2>Neuro-Symbolic Agent</h2>
-                        <p>Ask questions about traffic events. The agent uses multi-hop reasoning across vector, graph, and analytical databases.</p>
+                        <p>Multi-hop reasoning across vector, graph, and analytical databases.</p>
                         <div class="example-queries">
-                            <button class="example-btn" data-query="Summarize the accident and check if Vehicle 4 was speeding.">🚗 Summarize the accident</button>
-                            <button class="example-btn" data-query="Did Vehicle 4 brake too hard?">🛑 Hard braking check</button>
-                            <button class="example-btn" data-query="Which vehicles were involved in the collision?">💥 Collision vehicles</button>
+                            <button class="example-btn" data-query="What caused the accident?">Accident root cause</button>
+                            <button class="example-btn" data-query="Which vehicles were speeding?">Speed violations</button>
+                            <button class="example-btn" data-query="Find the most dangerous driver.">Dangerous driver</button>
+                            <button class="example-btn" data-query="Were any vehicles tailgating?">Tailgating check</button>
                         </div>
                     </div>
                 </div>
@@ -184,6 +322,34 @@
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                     </button>
                 </form>
+            </div>
+        </section>
+
+        <!-- ===== Alerts View ===== -->
+        <section class="view" id="alertsView">
+            <div class="alerts-header-row">
+                <div>
+                    <h2 class="alerts-title">Live Traffic Alerts</h2>
+                    <p class="alerts-subtitle">Real-time SSE stream from the physics pipeline. Connect a video to see alerts.</p>
+                </div>
+                <div class="alerts-controls">
+                    <span class="sse-indicator" id="sseIndicator">
+                        <span class="sse-dot disconnected" id="sseDot"></span>
+                        <span id="sseLabel">Disconnected</span>
+                    </span>
+                    <button class="run-btn small-btn" id="connectSseBtn">Connect</button>
+                    <button class="run-btn small-btn danger-btn" id="clearAlertsBtn">Clear</button>
+                </div>
+            </div>
+
+            <div class="alerts-list" id="alertsList">
+                <div class="alerts-empty">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3">
+                        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+                        <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+                    </svg>
+                    <p>No alerts yet. Connect the SSE stream and run a video to see real-time alerts.</p>
+                </div>
             </div>
         </section>
 

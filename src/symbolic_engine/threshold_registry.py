@@ -19,25 +19,40 @@ from __future__ import annotations
 
 THRESHOLD_PROVENANCE: dict[str, dict] = {
     "HARD_BRAKING": {
-        "value": 4.0,
+        "value": 3.0,
         "unit": "m/s²",
-        "source": "NCHRP Report 600 / UK Highway Code",
+        "source": "UK Highway Code / NCHRP Report 600",
         "description": (
-            "Deceleration exceeding 4 m/s² is considered emergency braking. "
-            "Normal comfortable braking is 2–3 m/s²; panic braking is 7–8 m/s². "
-            "4 m/s² is the boundary above which following drivers cannot react in "
-            "time at typical urban following distances."
+            "Signed deceleration exceeding -3.0 m/s² is classified as firm/emergency "
+            "braking. Normal comfortable braking is 1.5–2.5 m/s²; panic braking is "
+            "7–8 m/s². The -3.0 m/s² threshold catches aggressive braking events "
+            "that create rear-end collision risk for following drivers at urban "
+            "following distances (2 s headway at 50 km/h = 27.8 m stopping distance)."
         ),
     },
     "AGGRESSIVE_ACCELERATION": {
-        "value": 3.5,
+        "value": 3.0,
         "unit": "m/s²",
-        "source": "PIEV research / ADAS calibration standards",
+        "source": "SHRP2 NDS / PIEV research / ADAS calibration standards",
         "description": (
-            "Acceleration above 3.5 m/s² exceeds comfortable passenger tolerance "
-            "and correlates with aggressive driving behaviour in naturalistic "
-            "driving studies (SHRP2 NDS dataset). Maximum tyre friction limit is "
-            "approximately 9 m/s² on dry asphalt."
+            "Signed forward acceleration above +3.0 m/s² exceeds comfortable "
+            "passenger tolerance and correlates with aggressive driving in naturalistic "
+            "driving studies (SHRP2 NDS dataset). Only forward acceleration is "
+            "evaluated — braking events are handled by HARD_BRAKING. "
+            "Maximum tyre friction on dry asphalt is ~9 m/s²."
+        ),
+    },
+    "TAILGATING": {
+        "value": 1.5,
+        "unit": "s (time headway)",
+        "source": "FHWA SSAM / Highway Capacity Manual / UN ECE R131",
+        "description": (
+            "A time headway below 1.5 s is classified as tailgating. "
+            "At 50 km/h (13.9 m/s), 1.5 s headway = 20.8 m gap — the minimum "
+            "safe following distance per the Highway Capacity Manual. "
+            "Human perception-reaction time is 1.5 s under emergency conditions "
+            "(FHWA SSAM TTC critical threshold). Sustained tailgating (> 3 s) "
+            "is a primary cause of rear-end collisions."
         ),
     },
     "SPEEDING_DEFAULT": {

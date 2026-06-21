@@ -2,7 +2,7 @@
 Entity Extraction — Validation Layer
 =====================================
 Takes raw VLM JSON output and forces it into the strict Kùzu-graph-ready
-SPO schema using a local LLM (qwen2.5:72b via Ollama).
+SPO schema using a local LLM (gemma4:e2b via Ollama).
 
 This is the bridge between the neural VLM perception stage and the symbolic
 graph storage stage.  Every triple written to Kùzu passes through here.
@@ -89,7 +89,7 @@ class EntityExtractor:
     Uses a local LLM (ChatOllama) at temperature=0 for deterministic parsing.
 
     Args:
-        model_name: Ollama model tag. Defaults to 'qwen2.5:72b'.
+        model_name: Ollama model tag. Defaults to 'gemma4:e2b'.
     """
 
     _SYSTEM = (
@@ -105,12 +105,86 @@ class EntityExtractor:
         "{format_instructions}"
     )
 
-    def __init__(self, model_name: str = "qwen2.5:72b") -> None:
+    def __init__(self, model_name: str = "gemma4:e2b") -> None:
         self._llm = ChatOllama(model=model_name, temperature=0.0)
         self._parser = JsonOutputParser(pydantic_object=SceneGraphOutput)
         self._system_text = self._SYSTEM.format(
             format_instructions=self._parser.get_format_instructions()
         )
+
+    # Fields required for Kùzu insertion beyond the basic SPO keys.
+    _FULL_KEYS: frozenset = frozenset({
+        "subject", "subject_type", "predicate",
+        "object", "object_type", "motion_state", "phase",
+    })
+    _VALID_SUBJECT_TYPES: frozenset = frozenset({"Vehicle", "Pedestrian", "Infrastructure"})
+    _VALID_MOTION_STATES: frozenset = frozenset({"APPROACHING", "DIVERGING", "PARALLEL", "STATIONARY"})
+    _VALID_PHASES: frozenset = frozenset({"approach", "conflict", "resolution", "normal"})
+
+    def _try_fast_path(
+        self,
+        raw_vlm_text: str,
+        current_time: float,
+        active_track_ids: Optional[Set[int]],
+    ) -> Optional[List[dict]]:
+        """
+        Fast path: if the VLM already emitted fully-structured JSON triples,
+        skip the LLM extraction call entirely.
+
+        A triple passes the fast path when it has all required keys, non-empty
+        string values, and valid enum values for subject_type, object_type,
+        motion_state, and phase.  Triples with a missing or invalid enum are
+        NOT corrected here — they fall through to the LLM path which can infer
+        the right value from context.
+
+        Returns the validated list on success, or None if any triple fails so
+        the caller falls back to the LLM extractor.
+        """
+        try:
+            data = json.loads(raw_vlm_text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        # Accept both a bare list and the {"triples": [...]} wrapper.
+        if isinstance(data, dict):
+            data = data.get("triples", [])
+        if not isinstance(data, list) or not data:
+            return None
+
+        clean: List[dict] = []
+        for t in data:
+            if not isinstance(t, dict):
+                return None
+            if not self._FULL_KEYS.issubset(t.keys()):
+                return None
+            if not all(str(t[k]).strip() for k in ("subject", "predicate", "object")):
+                return None
+            if t.get("subject_type") not in self._VALID_SUBJECT_TYPES:
+                return None
+            if t.get("object_type") not in self._VALID_SUBJECT_TYPES:
+                return None
+            if t.get("motion_state") not in self._VALID_MOTION_STATES:
+                return None
+            if t.get("phase") not in self._VALID_PHASES:
+                return None
+            clean.append(dict(t))
+
+        # Hallucination filter — same logic as the LLM path.
+        if active_track_ids is not None:
+            before = len(clean)
+            clean = [
+                t for t in clean
+                if self._entity_id_valid(t["subject"], t["subject_type"], active_track_ids)
+                and self._entity_id_valid(t["object"], t["object_type"], active_track_ids)
+            ]
+            dropped = before - len(clean)
+            if dropped:
+                log.warning(
+                    "Fast-path dropped %d hallucinated triple(s) at t=%.2fs",
+                    dropped, current_time,
+                )
+
+        return clean
 
     def extract_triples(
         self,
@@ -120,6 +194,15 @@ class EntityExtractor:
     ) -> List[dict]:
         """
         Parse raw VLM output into validated SPO dicts for Kùzu insertion.
+
+        Fast path (no LLM call): when the VLM already emitted fully-structured
+        JSON triples with all required keys and valid enum values, the input is
+        accepted directly.  This avoids a redundant Ollama round-trip on every
+        macro-loop tick in the common case.
+
+        Slow path (LLM call): invoked only when the fast path fails — i.e. the
+        VLM returned free-text, partial JSON, or triples with missing/invalid
+        fields that need inference to repair.
 
         Args:
             raw_vlm_text:      JSON string or free-text from vlm_inference.py.
@@ -132,8 +215,20 @@ class EntityExtractor:
         Returns:
             List of validated triple dicts (may be empty on parse failure).
         """
+        log.debug("Extracting entities at t=%.2fs", current_time)
+
+        # --- Fast path -------------------------------------------------------
+        fast = self._try_fast_path(raw_vlm_text, current_time, active_track_ids)
+        if fast is not None:
+            log.debug(
+                "Fast-path accepted %d triple(s) at t=%.2fs — LLM call skipped",
+                len(fast), current_time,
+            )
+            return fast
+
+        # --- Slow path (LLM) -------------------------------------------------
+        log.debug("Fast-path failed at t=%.2fs — invoking LLM extractor", current_time)
         try:
-            log.debug("Extracting entities at t=%.2fs", current_time)
             messages = [
                 SystemMessage(content=self._system_text),
                 HumanMessage(
@@ -148,8 +243,6 @@ class EntityExtractor:
             )
             triples = result.get("triples", [])
 
-            # Fix 3: filter out triples where the VLM hallucinated a Vehicle ID
-            # that does not exist in the current tracked frame.
             if active_track_ids is not None:
                 before = len(triples)
                 triples = [
@@ -160,11 +253,14 @@ class EntityExtractor:
                 dropped = before - len(triples)
                 if dropped:
                     log.warning(
-                        "Dropped %d triple(s) with hallucinated Vehicle IDs at t=%.2fs",
+                        "Slow-path dropped %d hallucinated triple(s) at t=%.2fs",
                         dropped, current_time,
                     )
 
-            log.debug("Extracted %d triples at t=%.2fs", len(triples), current_time)
+            log.debug(
+                "Slow-path extracted %d triple(s) at t=%.2fs",
+                len(triples), current_time,
+            )
             return triples
 
         except Exception:

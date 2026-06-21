@@ -1,7 +1,7 @@
 """
 LangGraph Agent Tools — Neuro-Symbolic Bridge
 ==============================================
-Nineteen LangChain tools that expose the hybrid memory layer to the ReAct agent.
+Twenty LangChain tools that expose the hybrid memory layer to the ReAct agent.
 Each tool maps to a distinct reasoning modality:
 
   search_semantic_events      → Milvus ANN search (event-level)      (neural)
@@ -185,7 +185,9 @@ def verify_physics_math(start_time: float, end_time: float, track_id: int) -> st
         "Tool: verify_physics_math | vehicle=%d, t=%.1f-%.1f",
         track_id, start_time, end_time,
     )
-    df = _get_duckdb().get_trajectory_window(start_time, end_time, track_id)
+    df = _get_duckdb().get_trajectory_window(
+        start_time, end_time, track_id, trusted_only=True
+    )
 
     if df.empty:
         return (
@@ -197,7 +199,9 @@ def verify_physics_math(start_time: float, end_time: float, track_id: int) -> st
     # Bug note: taking max(|vel_x|) and max(|vel_y|) separately and combining
     # overestimates — the maxima may occur at different frames.
     df = df.copy()
-    df["_speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+    df["_speed"] = df["speed_ms"].fillna(
+        (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+    )
 
     # Signed acceleration: positive = speeding up, negative = braking.
     df["_accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
@@ -317,6 +321,7 @@ def evaluate_traffic_rules(
     track_id: int,
     start_time: float = 0.0,
     end_time: float = 9_999_999.0,
+    collision_timestamp: float = -1.0,
 ) -> str:
     """
     Symbolic Rule Engine — deterministic, auditable traffic violation detection.
@@ -327,22 +332,29 @@ def evaluate_traffic_rules(
 
     Rules evaluated:
       SPEEDING               — speed > posted zone limit (default 50 km/h)
-      HARD_BRAKING           — signed deceleration < −4.0 m/s²
-      AGGRESSIVE_ACCELERATION — acceleration magnitude > 3.5 m/s²
+      HARD_BRAKING           — signed deceleration < −3.0 m/s²
+      AGGRESSIVE_ACCELERATION — signed forward acceleration > 3.0 m/s²
       STATIONARY_IN_LANE     — stopped < 0.5 m/s for > 10 s in live lane
       WRONG_WAY              — heading > 90° from zone flow_direction_deg
                                (only fires when zone_config.json sets flow_direction_deg)
 
     Args:
-        track_id:   Integer vehicle ID (e.g. 4 for 'Vehicle 4').
-        start_time: Window start in seconds (default: 0.0).
-        end_time:   Window end in seconds (default: end of video).
+        track_id:            Integer vehicle ID (e.g. 4 for 'Vehicle 4').
+        start_time:          Window start in seconds (default: 0.0).
+        end_time:            Window end in seconds (default: end of video).
+        collision_timestamp: If the vehicle was involved in a collision, pass the
+                             collision time here (seconds). STATIONARY_IN_LANE and
+                             HARD_BRAKING violations that occur at or after this
+                             timestamp are suppressed — they are collision consequences,
+                             not driver violations. Pass -1.0 (default) to disable.
     """
     log.info(
         "Tool: evaluate_traffic_rules | vehicle=%d, t=%.1f-%.1f",
         track_id, start_time, end_time,
     )
-    df = _get_duckdb().get_trajectory_window(start_time, end_time, track_id)
+    df = _get_duckdb().get_trajectory_window(
+        start_time, end_time, track_id, trusted_only=True
+    )
 
     if df.empty:
         return (
@@ -367,6 +379,7 @@ def evaluate_traffic_rules(
         df, track_id,
         speed_limit_ms=speed_limit_ms,
         flow_direction_deg=flow_direction_deg,
+        collision_timestamp=collision_timestamp if collision_timestamp >= 0 else None,
     )
 
     # Collect assumptions from the first violation (all share the same assumptions)
@@ -381,11 +394,17 @@ def evaluate_traffic_rules(
             "WRONG_WAY rule disabled — flow_direction_deg not set in zone_config.json"
         )
 
+    active_limit_kmh = round(speed_limit_ms * 3.6, 0) if speed_limit_ms else 50.0
+
     if not violations:
         return json.dumps({
-            "vehicle_id": track_id,
-            "result": "NO_VIOLATIONS",
-            "message": "No traffic rule violations detected in this time window.",
+            "vehicle_id":        track_id,
+            "result":            "NO_VIOLATIONS",
+            "speed_limit_kmh":   active_limit_kmh,
+            "message": (
+                f"No traffic rule violations detected in this time window "
+                f"(speed limit applied: {active_limit_kmh:.0f} km/h)."
+            ),
             "_assumptions": eval_assumptions,
         }, indent=2)
 
@@ -403,10 +422,11 @@ def evaluate_traffic_rules(
         )
 
     return json.dumps({
-        "vehicle_id": track_id,
+        "vehicle_id":      track_id,
         "violation_count": len(violations),
-        "violations": [v.to_dict() for v in violations],
-        "_assumptions": eval_assumptions,
+        "speed_limit_kmh": active_limit_kmh,
+        "violations":      [v.to_dict() for v in violations],
+        "_assumptions":    eval_assumptions,
     }, indent=2)
 
 
@@ -542,7 +562,9 @@ def compare_vehicle_kinematics(
     results = []
 
     for track_id in ids:
-        df = db.get_trajectory_window(start_time, end_time, track_id)
+        df = db.get_trajectory_window(
+            start_time, end_time, track_id, trusted_only=True
+        )
         if df.empty:
             results.append({
                 "vehicle_id": track_id,
@@ -552,7 +574,9 @@ def compare_vehicle_kinematics(
             continue
 
         df = df.copy()
-        df["_speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        df["_speed"] = df["speed_ms"].fillna(
+            (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        )
         df["_accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
         dot = df["vel_x"] * df["accel_x"] + df["vel_y"] * df["accel_y"]
         df["_signed_accel"] = df["_accel_mag"].where(dot >= 0, -df["_accel_mag"])
@@ -1030,20 +1054,6 @@ def link_violation_to_conflict(
         "Tool: link_violation_to_conflict | cause=%d [%s] → effect=%d [%s] conf=%.2f",
         cause_track_id, cause_rule, effect_track_id, effect_type, confidence,
     )
-    # Get severity_score from HAS_VIOLATION for the cause vehicle if available
-    severity_score = 0.0
-    try:
-        rows = _get_graph().query_graph(
-            f"MATCH (v:Vehicle {{name: 'Vehicle {cause_track_id}'}})"
-            f"-[r:HAS_VIOLATION]->(v) "
-            f"WHERE r.violation_type = '{cause_rule}' "
-            f"RETURN r.evidence_json LIMIT 1"
-        )
-        if rows and "evidence_json" in rows[0]:
-            pass  # severity_score in evidence_json not yet stored; use 0.0 as default
-    except Exception:
-        pass
-
     _get_graph().insert_causal_link(
         cause_track_id=cause_track_id,
         cause_rule=cause_rule,

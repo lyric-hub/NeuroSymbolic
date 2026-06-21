@@ -1,5 +1,10 @@
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.py[cod]
 *.pyo
 *.pyd
@@ -17,15 +22,46 @@ wheels/
 venv/
 env/
 .env
+.env.*
+!.env.example
 
-# ─── Data — never commit raw video or DB files ────────────────────────────────
+# ─── Local agent/editor state ─────────────────────────────────────────────────
+.codex
+.claude/settings.local.json
+
+# ─── Data, databases, and generated results ───────────────────────────────────
 data/raw_videos/
 data/duckdb_storage/
 data/milvus_storage/
 data/graph_storage/
 data/ullooor/
-# BrnoCompSpeed/results/
-BrnoCompSpeed/session6_center/video.avi
+/BrnoCompSpeed/
+results/
+paper_results/
+data_exploration/paper_results/
+tests
+data_exploration
+
+*.db
+*.db-*
+*.duckdb
+*.duckdb.*
+*.sqlite
+*.sqlite3
+*.wal
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.csv
+*.dat
+
+# ─── Documents and notebooks ──────────────────────────────────────────────────
+*.pdf
+*.txt
+!requirements.txt
+!**/requirements.txt
+*.ipynb
 
 
 # ─── Calibration & zone config (machine-specific, generated locally) ──────────
@@ -33,8 +69,10 @@ BrnoCompSpeed/session6_center/video.avi
 # zone_config.json
 
 # ─── Model weights ────────────────────────────────────────────────────────────
-# *.pt
-# *.pth
+models/
+checkpoints/
+*.pt
+*.pth
 *.onnx
 *.engine
 *.trt
@@ -43,6 +81,20 @@ BrnoCompSpeed/session6_center/video.avi
 
 # ─── Jupyter ──────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+# ─── Media and archives ───────────────────────────────────────────────────────
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.zip
+*.tar
+*.tar.gz
+*.tgz
 
 # ─── OS / IDE ─────────────────────────────────────────────────────────────────
 .DS_Store
@@ -61,5 +113,3 @@ secrets.json
 *.tmp
 
 # ─── Misc ───────────────────────────────────────────────────────────────────
-
-*.mp4

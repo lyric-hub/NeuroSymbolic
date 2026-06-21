@@ -528,3 +528,101 @@ def load_detector(
 
     model = _load_yolo_model(spec)
     return YoloDetector(model, defaults)
+
+
+# ---------------------------------------------------------------------------
+# YOLO-Pose detector
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=4)
+def _load_yolo_pose_model(weights: str) -> Any:
+    """Load a YOLO-Pose model from weights file (cached)."""
+    from ultralytics import YOLO
+    weight_path = Path(weights).expanduser().resolve()
+    return YOLO(str(weight_path), task="pose")
+
+
+class YoloPoseDetector(Detector):
+    """YOLO-Pose wrapper — single forward pass returns bboxes and keypoints.
+
+    Use ``predict_with_pose`` in the physics micro-loop to get both the
+    Ultralytics Results object (passed to VehicleTracker unchanged) and the
+    raw keypoint array used for kp31 ground-plane projection.
+    """
+
+    def __init__(self, model: Any, defaults: DetectDefaults) -> None:
+        self.model    = model
+        self.defaults = defaults
+
+    def predict(
+        self,
+        source: Any,
+        *,
+        vocab: Optional[Sequence[str]] = None,
+        classes: Optional[Sequence[int]] = None,
+        **kwargs,
+    ) -> Any:
+        """Standard predict — returns list of Ultralytics Results (pose task)."""
+        conf       = kwargs.pop("conf",   self.defaults.conf)
+        imgsz      = kwargs.pop("imgsz",  self.defaults.imgsz)
+        half       = kwargs.pop("half",   self.defaults.half)
+        device_arg = kwargs.pop("device", self.defaults.device)
+        resolved   = _resolve_device(device_arg)
+        return self.model.predict(
+            source,
+            conf=conf,
+            imgsz=imgsz,
+            half=half,
+            device=resolved.index if resolved.type == "cuda" else "cpu",
+            verbose=False,
+        )
+
+    def predict_with_pose(
+        self,
+        source: Any,
+        conf: Optional[float] = None,
+    ) -> tuple[Any, np.ndarray]:
+        """Run pose inference and return (result, keypoints_np).
+
+        Args:
+            source: BGR frame (numpy array) or any Ultralytics-compatible input.
+            conf  : Detection confidence threshold. Falls back to init default.
+
+        Returns:
+            result      : Ultralytics Results object (pass directly to
+                          VehicleTracker.update — it handles .boxes).
+            keypoints_np: (N, 33, 3) float32 array of (x, y, confidence) for
+                          every detected vehicle, aligned to result.boxes.
+                          Shape is (0, 33, 3) when no vehicles are detected.
+        """
+        results = self.model.predict(
+            source,
+            conf=conf if conf is not None else self.defaults.conf,
+            verbose=False,
+        )
+        r = results[0]
+        if r.boxes is None or r.keypoints is None or len(r.boxes) == 0:
+            return r, np.empty((0, 33, 3), dtype=np.float32)
+        kps_np = r.keypoints.data.cpu().numpy().astype(np.float32)
+        return r, kps_np
+
+
+def load_pose_detector(
+    weights: str,
+    *,
+    device: DeviceArg = None,
+    conf: float = 0.25,
+) -> YoloPoseDetector:
+    """Load the YOLO-Pose model used for kp31 ground-plane speed estimation.
+
+    Args:
+        weights: Path to the .pt pose model weights file.
+        device : Torch device ('cuda', 'cpu', 0, or None for auto).
+        conf   : Detection confidence threshold.
+
+    Returns:
+        YoloPoseDetector instance.
+    """
+    model    = _load_yolo_pose_model(str(Path(weights).expanduser().resolve()))
+    defaults = DetectDefaults(device=device, conf=conf)
+    return YoloPoseDetector(model, defaults)

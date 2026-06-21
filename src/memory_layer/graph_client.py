@@ -13,7 +13,7 @@ class GraphClient:
     Uses Kùzu, an embedded, purely local graph database (the 'DuckDB of graphs'),
     which saves directly to the data/graph_storage folder without needing a server.
     """
-    def __init__(self, db_path: str = "data/graph_storage/traffic_graph"):
+    def __init__(self, db_path: str = "data/graph_storage/traffic_graph_db"):
         # Ensure the data directory exists based on your VS Code structure
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
@@ -298,8 +298,8 @@ class GraphClient:
             evidence:       Dict of numeric evidence from the rule engine.
         """
         name = f"Vehicle {track_id}"
-        self._upsert_entity(name, "Vehicle")
         try:
+            self._upsert_entity(name, "Vehicle")
             self.conn.execute(
                 """
                 MATCH (v:Vehicle {name: $name})
@@ -355,9 +355,9 @@ class GraphClient:
         """
         cause_name  = f"Vehicle {cause_track_id}"
         effect_name = f"Vehicle {effect_track_id}"
-        self._upsert_entity(cause_name, "Vehicle")
-        self._upsert_entity(effect_name, "Vehicle")
         try:
+            self._upsert_entity(cause_name, "Vehicle")
+            self._upsert_entity(effect_name, "Vehicle")
             self.conn.execute(
                 """
                 MATCH (c:Vehicle {name: $cause}), (e:Vehicle {name: $effect})

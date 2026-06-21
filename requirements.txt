@@ -20,6 +20,8 @@ langgraph
 langchain-core
 langchain-community
 langchain-ollama
+langchain-openai
+python-dotenv
 python-multipart
 fastapi
 uvicorn

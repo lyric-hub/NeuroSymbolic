@@ -23,10 +23,11 @@ This separation is fundamental to Neuro-Symbolic AI:
 Rules
 -----
 SPEEDING                — sustained speed above the posted limit (default 50 km/h)
-HARD_BRAKING            — deceleration below −4.0 m/s²
-AGGRESSIVE_ACCELERATION — acceleration magnitude above 3.5 m/s²
+HARD_BRAKING            — signed deceleration below −3.0 m/s² (firm/emergency braking)
+AGGRESSIVE_ACCELERATION — signed forward acceleration above +3.0 m/s²
 WRONG_WAY               — vehicle heading > 90° from expected flow direction
 STATIONARY_IN_LANE      — vehicle stopped (< 0.5 m/s) for > 10 s in a live lane
+TAILGATING              — time headway to leading vehicle < 1.5 s for > 3 s
 
 Thresholds are module-level constants and can be adjusted to match local
 speed limits or road types without touching any rule logic.
@@ -48,13 +49,15 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 SPEEDING_THRESHOLD_MS: float = 13.89        # 50 km/h in m/s  (overridden per-zone)
-HARD_BRAKING_THRESHOLD: float = -4.0        # m/s²  (negative = deceleration)
-AGGRESSIVE_ACCEL_THRESHOLD: float = 3.5     # m/s²  (magnitude)
+HARD_BRAKING_THRESHOLD: float = -3.0        # m/s²  (UK Highway Code: -3 m/s² = firm braking)
+AGGRESSIVE_ACCEL_THRESHOLD: float = 3.0     # m/s²  (signed, forward direction only)
 WRONG_WAY_ANGLE_DEG: float = 90.0          # heading must differ > this to fire
 WRONG_WAY_MIN_SPEED_MS: float = 1.0        # ignore stationary/very-slow vehicles
 WRONG_WAY_MIN_DURATION_S: float = 1.0      # require sustained wrong-way before firing
 STATIONARY_MIN_DURATION_S: float = 10.0    # seconds stopped to trigger the rule
 STATIONARY_SPEED_THRESHOLD_MS: float = 0.5 # m/s below which vehicle is "stopped"
+SHORT_HEADWAY_THRESHOLD_S: float = 1.5     # time headway below which tailgating fires
+SHORT_HEADWAY_MIN_DURATION_S: float = 3.0  # must persist 3 s before flagging
 
 
 # ---------------------------------------------------------------------------
@@ -117,19 +120,28 @@ class TrafficRuleEngine:
         track_id: int,
         speed_limit_ms: Optional[float] = None,
         flow_direction_deg: Optional[float] = None,
+        leader_df: Optional[pd.DataFrame] = None,
+        collision_timestamp: Optional[float] = None,
     ) -> List[RuleViolation]:
         """
         Evaluate all rules against the trajectory DataFrame for one vehicle.
 
         Args:
-            df:                DataFrame from ``DuckDBClient.get_trajectory_window()``.
-                               Required columns: timestamp, vel_x, vel_y, accel_x, accel_y.
-            track_id:          The vehicle's integer track identifier.
-            speed_limit_ms:    Per-zone posted speed limit in m/s.  When provided,
-                               overrides the module-level ``SPEEDING_THRESHOLD_MS``.
-                               Pass ``zone_config.speed_limit_kmh / 3.6``.
+            df:                 DataFrame from ``DuckDBClient.get_trajectory_window()``.
+                                Required columns: timestamp, vel_x, vel_y, accel_x, accel_y.
+            track_id:           The vehicle's integer track identifier.
+            speed_limit_ms:     Per-zone posted speed limit in m/s.  When provided,
+                                overrides the module-level ``SPEEDING_THRESHOLD_MS``.
+                                Pass ``zone_config.speed_limit_kmh / 3.6``.
             flow_direction_deg: Expected travel direction (degrees, 0=East 90=North CCW).
-                               When provided, enables the WRONG_WAY rule.
+                                When provided, enables the WRONG_WAY rule.
+            leader_df:          Optional DataFrame of the leading vehicle's trajectory
+                                (same columns as df). When provided, enables TAILGATING
+                                by computing per-frame time headway from gap and speed.
+            collision_timestamp: If provided, STATIONARY_IN_LANE and HARD_BRAKING
+                                violations that start at or after this timestamp are
+                                suppressed — they are collision consequences, not
+                                independent driver violations.
 
         Returns:
             List of RuleViolation instances (empty list if no rules fire).
@@ -139,7 +151,17 @@ class TrafficRuleEngine:
 
         # Pre-compute derived columns used by multiple rules.
         df = df.copy()
-        df["speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+        if "trusted_for_rules" in df.columns:
+            df = df[df["trusted_for_rules"]].copy()
+            if df.empty:
+                return []
+
+        if "speed_ms" in df.columns:
+            df["speed"] = df["speed_ms"].fillna(
+                (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
+            )
+        else:
+            df["speed"] = (df["vel_x"] ** 2 + df["vel_y"] ** 2) ** 0.5
         df["accel_mag"] = (df["accel_x"] ** 2 + df["accel_y"] ** 2) ** 0.5
         # Direction-aware signed acceleration: dot(velocity, acceleration) determines
         # braking vs accelerating, so the rule fires correctly at any heading angle.
@@ -165,7 +187,54 @@ class TrafficRuleEngine:
         violations += self._check_stationary_in_lane(df, track_id, assumptions)
         if flow_direction_deg is not None:
             violations += self._check_wrong_way(df, track_id, flow_direction_deg, assumptions)
+        if leader_df is not None and not leader_df.empty:
+            merged = self._compute_headway(df, leader_df)
+            violations += self._check_tailgating(merged, track_id, assumptions)
+
+        # Suppress violations that are consequences of a collision, not driver behaviour.
+        # STATIONARY_IN_LANE and HARD_BRAKING occurring at or after the collision
+        # timestamp reflect physics of impact, not an independent infraction.
+        if collision_timestamp is not None:
+            _post_collision_rules = {"STATIONARY_IN_LANE", "HARD_BRAKING"}
+            violations = [
+                v for v in violations
+                if not (
+                    v.rule_id in _post_collision_rules
+                    and v.first_occurrence_s >= collision_timestamp
+                )
+            ]
+
         return violations
+
+    @staticmethod
+    def _compute_headway(
+        follower: pd.DataFrame,
+        leader: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Merges follower and leader trajectories on nearest timestamp and computes
+        per-frame time headway = gap_m / follower_speed.
+
+        Gap is the longitudinal distance between the front of the follower
+        and the rear of the leader, approximated as |leader.pos_y - follower.pos_y|
+        minus a fixed 4 m vehicle length.
+        """
+        f = follower[["timestamp", "pos_y", "speed_ms", "vel_x", "vel_y",
+                       "accel_x", "accel_y", "signed_accel"]].copy()
+        l = leader[["timestamp", "pos_y"]].rename(
+            columns={"pos_y": "leader_pos_y"}
+        )
+        merged = pd.merge_asof(
+            f.sort_values("timestamp"),
+            l.sort_values("timestamp"),
+            on="timestamp",
+            direction="nearest",
+        )
+        merged["gap_m"] = (merged["leader_pos_y"] - merged["pos_y"] - 4.0).clip(lower=0.0)
+        merged["time_headway_s"] = (
+            merged["gap_m"] / merged["speed_ms"].clip(lower=0.5)
+        )
+        return merged
 
     # ------------------------------------------------------------------
     # Individual rule checkers
@@ -180,7 +249,9 @@ class TrafficRuleEngine:
     ) -> List[RuleViolation]:
         """SPEEDING — any frame where speed exceeds the posted limit."""
         threshold = speed_limit_ms if speed_limit_ms is not None else SPEEDING_THRESHOLD_MS
-        over = df[df["speed"] > threshold]
+        # Add 0.28 m/s (1 km/h) tolerance — avoids false positives from floating
+        # point noise when a vehicle cruises exactly at the limit.
+        over = df[df["speed"] > threshold + 0.278]
         if over.empty:
             return []
 
@@ -280,20 +351,28 @@ class TrafficRuleEngine:
         track_id: int,
         assumptions: Optional[list] = None,
     ) -> List[RuleViolation]:
-        """AGGRESSIVE_ACCELERATION — acceleration magnitude exceeds threshold."""
-        aggressive = df[df["accel_mag"] > AGGRESSIVE_ACCEL_THRESHOLD]
+        """
+        AGGRESSIVE_ACCELERATION — signed forward acceleration above threshold.
+
+        Uses signed_accel (pre-computed in evaluate()) so only genuine forward
+        acceleration bursts fire the rule.  Braking events (negative signed_accel)
+        are handled by HARD_BRAKING and never trigger this rule.
+        """
+        aggressive = df[df["signed_accel"] > AGGRESSIVE_ACCEL_THRESHOLD]
         if aggressive.empty:
             return []
 
-        max_accel  = float(df["accel_mag"].max())
+        max_accel   = float(df["signed_accel"].max())
         pct_flagged = round(100.0 * len(aggressive) / max(len(df), 1), 1)
-        excess     = max_accel - AGGRESSIVE_ACCEL_THRESHOLD
-        severity_score = round(min(1.0, excess / 3.5) * min(1.0, pct_flagged / 20.0), 3)
+        excess      = max_accel - AGGRESSIVE_ACCEL_THRESHOLD
+        severity_score = round(
+            min(1.0, excess / 3.0) * min(1.0, pct_flagged / 20.0), 3
+        )
 
         return [RuleViolation(
             rule_id="AGGRESSIVE_ACCELERATION",
             description=(
-                f"Vehicle {track_id} aggressive acceleration — "
+                f"Vehicle {track_id} aggressive forward acceleration — "
                 f"peak {max_accel:.2f} m/s² ({pct_flagged:.0f}% of window)"
             ),
             track_id=track_id,
@@ -301,10 +380,73 @@ class TrafficRuleEngine:
             severity="warning",
             severity_score=severity_score,
             evidence={
-                "peak_accel_ms2": round(max_accel, 2),
-                "threshold_ms2": AGGRESSIVE_ACCEL_THRESHOLD,
-                "frames_flagged": int(len(aggressive)),
+                "peak_accel_ms2":    round(max_accel, 2),
+                "threshold_ms2":     AGGRESSIVE_ACCEL_THRESHOLD,
+                "frames_flagged":    int(len(aggressive)),
                 "pct_frames_flagged": pct_flagged,
+            },
+            assumptions=list(assumptions or []),
+        )]
+
+    @staticmethod
+    def _check_tailgating(
+        df: pd.DataFrame,
+        track_id: int,
+        assumptions: Optional[list] = None,
+    ) -> List[RuleViolation]:
+        """
+        TAILGATING — time headway column (if present) below SHORT_HEADWAY_THRESHOLD_S
+        for a sustained period.
+
+        Time headway is computed externally (e.g. by get_vehicle_proximity) and
+        injected as a 'time_headway_s' column.  When the column is absent this
+        rule is skipped — it cannot fire without inter-vehicle spacing data.
+
+        If only a 'gap_m' and 'speed_ms' column are present, headway is derived
+        as gap_m / max(speed_ms, 0.5).
+        """
+        if "time_headway_s" not in df.columns:
+            if "gap_m" in df.columns and "speed_ms" in df.columns:
+                df = df.copy()
+                df["time_headway_s"] = df["gap_m"] / df["speed_ms"].clip(lower=0.5)
+            else:
+                return []
+
+        close = df[df["time_headway_s"] < SHORT_HEADWAY_THRESHOLD_S]
+        if close.empty:
+            return []
+
+        # Require sustained tailgating (not just one frame)
+        duration_s = float(close["timestamp"].max()) - float(close["timestamp"].min())
+        if duration_s < SHORT_HEADWAY_MIN_DURATION_S:
+            return []
+
+        min_hw       = float(close["time_headway_s"].min())
+        pct_flagged  = round(100.0 * len(close) / max(len(df), 1), 1)
+        severity_score = round(
+            min(1.0, (SHORT_HEADWAY_THRESHOLD_S - min_hw) / SHORT_HEADWAY_THRESHOLD_S)
+            * min(1.0, duration_s / 10.0),
+            3,
+        )
+
+        return [RuleViolation(
+            rule_id="TAILGATING",
+            description=(
+                f"Vehicle {track_id} tailgating — "
+                f"minimum time headway {min_hw:.2f}s "
+                f"(threshold {SHORT_HEADWAY_THRESHOLD_S}s) "
+                f"sustained for {duration_s:.1f}s"
+            ),
+            track_id=track_id,
+            first_occurrence_s=float(close["timestamp"].iloc[0]),
+            severity="violation",
+            severity_score=severity_score,
+            evidence={
+                "min_time_headway_s":       round(min_hw, 3),
+                "threshold_time_headway_s": SHORT_HEADWAY_THRESHOLD_S,
+                "sustained_duration_s":     round(duration_s, 2),
+                "frames_flagged":           int(len(close)),
+                "pct_frames_flagged":       pct_flagged,
             },
             assumptions=list(assumptions or []),
         )]

@@ -2,8 +2,34 @@ import json as _json
 from pathlib import Path
 from typing import Dict, List
 import duckdb
+import pandas as pd
 
 FLUSH_EVERY_N_FRAMES = 100
+
+
+def _to_dicts(cursor) -> list:
+    """
+    Convert a DuckDB cursor result to a list of dicts without the Arrow bridge.
+
+    DuckDB's .df() method routes through an Arrow C++ bridge that conflicts with
+    the Kuzu graph-DB C++ allocator in the same process (SIGSEGV).
+    This helper uses plain fetchall() + description to build dicts in Python,
+    completely sidestepping that bridge.
+    """
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def _to_df(cursor) -> pd.DataFrame:
+    """
+    Build a pandas DataFrame from a DuckDB cursor without the Arrow bridge.
+
+    Equivalent to cursor.df() but uses fetchall() so it is safe when Kuzu
+    is also imported in the same process.
+    """
+    cols = [d[0] for d in cursor.description]
+    rows = cursor.fetchall()
+    return pd.DataFrame(rows, columns=cols)
 
 class DuckDBClient:
     """
@@ -39,7 +65,16 @@ class DuckDBClient:
                 accel_y              DOUBLE,
                 class_label          VARCHAR,
                 interpolated         BOOLEAN,
-                detection_confidence DOUBLE
+                detection_confidence DOUBLE,
+                speed_ms             DOUBLE,
+                measurement_used     BOOLEAN,
+                predicted_only       BOOLEAN,
+                outlier_rejected     BOOLEAN,
+                track_warm           BOOLEAN,
+                trusted_for_rules    BOOLEAN,
+                association_iou      DOUBLE,
+                inside_calibration_core BOOLEAN,
+                strong_association   BOOLEAN
             )
         """)
         # Migrations: add columns to existing databases that pre-date them.
@@ -47,6 +82,15 @@ class DuckDBClient:
             "ALTER TABLE vehicle_trajectories ADD COLUMN class_label VARCHAR DEFAULT 'unknown'",
             "ALTER TABLE vehicle_trajectories ADD COLUMN interpolated BOOLEAN DEFAULT FALSE",
             "ALTER TABLE vehicle_trajectories ADD COLUMN detection_confidence DOUBLE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN speed_ms DOUBLE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN measurement_used BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN predicted_only BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN outlier_rejected BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN track_warm BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN trusted_for_rules BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN association_iou DOUBLE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN inside_calibration_core BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE vehicle_trajectories ADD COLUMN strong_association BOOLEAN DEFAULT TRUE",
         ]:
             try:
                 self.conn.execute(migration_sql)
@@ -124,6 +168,7 @@ class DuckDBClient:
         state_vectors: Dict[int, List[float]],
         class_labels: Dict[int, str] = None,
         detection_confidences: Dict[int, float] = None,
+        state_quality: Dict[int, dict] = None,
     ):
         """
         Rapidly ingests the dictionary output from kinematics.py.
@@ -139,19 +184,32 @@ class DuckDBClient:
             detection_confidences:  Optional {track_id: confidence} from YOLO (0.0–1.0).
                                     Stored so data quality reports can report mean
                                     detection confidence per vehicle/window.
+            state_quality:          Optional per-track quality flags from
+                                    KinematicEstimator.update().
         """
         if not state_vectors:
             return
 
         _labels = class_labels or {}
-        _confs = detection_confidences or {}
+        _confs  = detection_confidences or {}
+        _quality = state_quality or {}
         for track_id, sv in state_vectors.items():
+            q = _quality.get(track_id, {})
             self._buffer.append((
                 timestamp, frame_id, track_id,
                 sv[0], sv[1], sv[2], sv[3], sv[4], sv[5],
                 _labels.get(track_id, "unknown"),
-                False,                              # interpolated = False for real detections
-                _confs.get(track_id, None),         # detection_confidence (NULL if unknown)
+                bool(q.get("interpolated", False)),
+                _confs.get(track_id, None),
+                q.get("speed_ms"),
+                bool(q.get("measurement_used", True)),
+                bool(q.get("predicted_only", False)),
+                bool(q.get("outlier_rejected", False)),
+                bool(q.get("track_warm", False)),
+                bool(q.get("trusted_for_rules", False)),
+                q.get("association_iou"),
+                bool(q.get("inside_calibration_core", True)),
+                bool(q.get("strong_association", True)),
             ))
 
         self._frames_since_flush += 1
@@ -163,7 +221,7 @@ class DuckDBClient:
         if not self._buffer:
             return
         self.conn.executemany(
-            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO vehicle_trajectories VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             self._buffer,
         )
         self._buffer.clear()
@@ -204,12 +262,27 @@ class DuckDBClient:
                 _labels.get(row["track_id"], "unknown"),
                 True,   # interpolated = True
                 None,   # detection_confidence = NULL (synthetic row, no YOLO detection)
+                row.get("speed_ms"),
+                bool(row.get("measurement_used", False)),
+                bool(row.get("predicted_only", False)),
+                bool(row.get("outlier_rejected", False)),
+                bool(row.get("track_warm", False)),
+                bool(row.get("trusted_for_rules", False)),
+                row.get("association_iou"),
+                bool(row.get("inside_calibration_core", False)),
+                bool(row.get("strong_association", False)),
             ))
         # Flush immediately: synthetic rows should be persisted before the next
         # real frame's data so the timeline stays ordered in DuckDB.
         self._flush()
 
-    def get_trajectory_window(self, start_time: float, end_time: float, track_id: int):
+    def get_trajectory_window(
+        self,
+        start_time: float,
+        end_time: float,
+        track_id: int,
+        trusted_only: bool = False,
+    ):
         """
         Tool for the LangGraph Agent: Retrieves the smoothed physics data 
         for a specific vehicle during a specific semantic event window.
@@ -217,14 +290,19 @@ class DuckDBClient:
         Returns:
             A Pandas DataFrame containing the trajectory.
         """
-        query = """
-            SELECT timestamp, pos_x, pos_y, vel_x, vel_y, accel_x, accel_y 
-            FROM vehicle_trajectories 
-            WHERE track_id =? AND timestamp >=? AND timestamp <=?
+        trust_clause = "AND trusted_for_rules" if trusted_only else ""
+        query = f"""
+            SELECT
+                timestamp, pos_x, pos_y, vel_x, vel_y, accel_x, accel_y,
+                speed_ms, class_label, interpolated, detection_confidence,
+                measurement_used, predicted_only, outlier_rejected,
+                track_warm, trusted_for_rules, association_iou,
+                inside_calibration_core, strong_association
+            FROM vehicle_trajectories
+            WHERE track_id =? AND timestamp >=? AND timestamp <=? {trust_clause}
             ORDER BY timestamp ASC
         """
-        # Returns a pandas dataframe for easy analytical processing by the agent
-        return self.conn.execute(query, (track_id, start_time, end_time)).df()
+        return _to_df(self.conn.execute(query, (track_id, start_time, end_time)))
 
     def get_vehicles_by_class(self, class_label: str) -> List[dict]:
         """
@@ -253,11 +331,8 @@ class DuckDBClient:
             ORDER BY track_id
             """,
             (f"%{class_label}%",),
-        ).df()
-
-        if result.empty:
-            return []
-        return result.to_dict(orient="records")
+        )
+        return _to_dicts(result)
 
     def get_behavior_summary(
         self,
@@ -293,14 +368,18 @@ class DuckDBClient:
         lines = []
 
         for tid in sorted(track_ids):
-            df = self.get_trajectory_window(start_time, current_time, tid)
+            df = self.get_trajectory_window(
+                start_time, current_time, tid, trusted_only=True
+            )
             if df.empty:
-                lines.append(f"  Vehicle {tid}: no history yet (just appeared)")
+                lines.append(f"  Vehicle {tid}: no trusted history yet")
                 continue
 
             # Compute scalar speed and signed acceleration
             df = df.copy()
-            df["speed"]       = (df["vel_x"]**2   + df["vel_y"]**2  ).pow(0.5)
+            df["speed"]       = df["speed_ms"].fillna(
+                (df["vel_x"]**2 + df["vel_y"]**2).pow(0.5)
+            )
             df["accel_mag"]   = (df["accel_x"]**2 + df["accel_y"]**2).pow(0.5)
             dot               = df["vel_x"]*df["accel_x"] + df["vel_y"]*df["accel_y"]
             df["signed_accel"] = df["accel_mag"].where(dot >= 0, -df["accel_mag"])
@@ -409,7 +488,7 @@ class DuckDBClient:
         where = " AND ".join(filters)
 
         # Per-gate enter/exit counts
-        counts_df = self.conn.execute(
+        counts_rows = _to_dicts(self.conn.execute(
             f"""
             SELECT gate_name, direction, COUNT(*) AS cnt
             FROM zone_crossings
@@ -418,10 +497,10 @@ class DuckDBClient:
             ORDER BY gate_name, direction
             """,
             params,
-        ).df()
+        ))
 
         gate_counts: dict = {}
-        for _, row in counts_df.iterrows():
+        for row in counts_rows:
             g = row["gate_name"]
             if g not in gate_counts:
                 gate_counts[g] = {"enter": 0, "exit": 0}
@@ -429,7 +508,7 @@ class DuckDBClient:
 
         # OD pairs — join each vehicle's first entry with its last exit.
         # confidence = 'confirmed' only if BOTH entry and exit were confirmed.
-        od_df = self.conn.execute(
+        od_pairs = _to_dicts(self.conn.execute(
             f"""
             WITH enters AS (
                 SELECT
@@ -470,9 +549,7 @@ class DuckDBClient:
             ORDER BY e.entry_time ASC
             """,
             params * 2,
-        ).df()
-
-        od_pairs = od_df.to_dict(orient="records")
+        ))
 
         return {"gate_counts": gate_counts, "od_pairs": od_pairs}
 
@@ -573,7 +650,7 @@ class DuckDBClient:
         time window.
 
         Covers three quality dimensions:
-          1. Frame coverage — how many rows are real vs interpolated (synthetic).
+          1. Frame coverage — how many rows are real vs predicted vs interpolated.
           2. Detection confidence — mean YOLO confidence for real frames.
           3. Gate crossing confidence — confirmed vs estimated crossings.
 
@@ -600,9 +677,12 @@ class DuckDBClient:
             f"""
             SELECT
                 COUNT(*)                                          AS total_frames,
-                SUM(CASE WHEN NOT interpolated THEN 1 ELSE 0 END) AS real_frames,
-                SUM(CASE WHEN interpolated     THEN 1 ELSE 0 END) AS interp_frames,
-                AVG(CASE WHEN NOT interpolated
+                SUM(CASE WHEN measurement_used AND NOT predicted_only AND NOT interpolated
+                         THEN 1 ELSE 0 END) AS real_frames,
+                SUM(CASE WHEN predicted_only THEN 1 ELSE 0 END) AS predicted_frames,
+                SUM(CASE WHEN interpolated   THEN 1 ELSE 0 END) AS interp_frames,
+                SUM(CASE WHEN trusted_for_rules THEN 1 ELSE 0 END) AS trusted_frames,
+                AVG(CASE WHEN measurement_used AND NOT predicted_only AND NOT interpolated
                          THEN detection_confidence END)           AS mean_conf
             FROM vehicle_trajectories
             WHERE timestamp >= ? AND timestamp <= ? {track_filter}
@@ -612,8 +692,10 @@ class DuckDBClient:
 
         total     = int(row[0] or 0)
         real      = int(row[1] or 0)
-        interp    = int(row[2] or 0)
-        mean_conf = round(float(row[3]), 3) if row[3] is not None else None
+        predicted = int(row[2] or 0)
+        interp    = int(row[3] or 0)
+        trusted   = int(row[4] or 0)
+        mean_conf = round(float(row[5]), 3) if row[5] is not None else None
         coverage  = round(100.0 * real / total, 1) if total > 0 else 0.0
 
         # Gate crossing confidence breakdown
@@ -645,7 +727,9 @@ class DuckDBClient:
             "time_window": f"{start_time}-{end_time}",
             "total_frames": total,
             "real_frames": real,
+            "predicted_only_frames": predicted,
             "interpolated_frames": interp,
+            "trusted_frames": trusted,
             "coverage_pct": coverage,
             "mean_detection_confidence": mean_conf,
             "confirmed_gate_crossings": confirmed_crossings,
@@ -743,12 +827,16 @@ class DuckDBClient:
                            nearest_landmark, distance_to_landmark_m.
         """
         self._flush()
-        df = self.get_trajectory_window(start_time, end_time, track_id)
+        df = self.get_trajectory_window(
+            start_time, end_time, track_id, trusted_only=True
+        )
         if df.empty:
             return []
         step = max(1, len(df) // max_rows)
         sampled = df.iloc[::step].copy()
-        sampled["_speed"] = (sampled["vel_x"] ** 2 + sampled["vel_y"] ** 2) ** 0.5
+        sampled["_speed"] = sampled["speed_ms"].fillna(
+            (sampled["vel_x"] ** 2 + sampled["vel_y"] ** 2) ** 0.5
+        )
         result = []
         for _, row in sampled.iterrows():
             lm, dist = self.nearest_landmark(float(row["pos_x"]), float(row["pos_y"]))
@@ -817,8 +905,12 @@ class DuckDBClient:
         """
         import pandas as pd
         self._flush()
-        df_a = self.get_trajectory_window(start_time, end_time, track_id_a)
-        df_b = self.get_trajectory_window(start_time, end_time, track_id_b)
+        df_a = self.get_trajectory_window(
+            start_time, end_time, track_id_a, trusted_only=True
+        )
+        df_b = self.get_trajectory_window(
+            start_time, end_time, track_id_b, trusted_only=True
+        )
         if df_a.empty or df_b.empty:
             return {"error": f"No data for one or both vehicles (ids={track_id_a},{track_id_b}) in t={start_time}-{end_time}s."}
 
@@ -911,10 +1003,11 @@ class DuckDBClient:
             WHERE track_id = ?
               AND timestamp >= ?
               AND timestamp <= ?
+              AND trusted_for_rules
             GROUP BY time_bucket
             ORDER BY time_bucket
         """
-        df = self.conn.execute(query, (track_id, start_time, end_time)).df()
+        df = _to_df(self.conn.execute(query, (track_id, start_time, end_time)))
         if df.empty:
             return []
 
@@ -992,10 +1085,11 @@ class DuckDBClient:
             FROM vehicle_trajectories
             WHERE timestamp >= ?
               AND timestamp <= ?
+              AND trusted_for_rules
             GROUP BY track_id, time_bucket
             ORDER BY time_bucket, track_id
         """
-        df = self.conn.execute(query, (start_time, end_time)).df()
+        df = _to_df(self.conn.execute(query, (start_time, end_time)))
         if df.empty:
             return []
 
@@ -1057,8 +1151,12 @@ class DuckDBClient:
         """
         import pandas as pd
         self._flush()
-        df_a = self.get_trajectory_window(start_time, end_time, track_id_a)
-        df_b = self.get_trajectory_window(start_time, end_time, track_id_b)
+        df_a = self.get_trajectory_window(
+            start_time, end_time, track_id_a, trusted_only=True
+        )
+        df_b = self.get_trajectory_window(
+            start_time, end_time, track_id_b, trusted_only=True
+        )
         if df_a.empty or df_b.empty:
             return {
                 "error": (
@@ -1183,10 +1281,11 @@ class DuckDBClient:
             WITH speeds AS (
                 SELECT
                     track_id,
-                    MIN(class_label) AS class_label,
-                    SQRT(vel_x * vel_x + vel_y * vel_y) AS speed_ms
+                    class_label,
+                    speed_ms
                 FROM vehicle_trajectories
                 WHERE timestamp >= ? AND timestamp <= ?
+                  AND trusted_for_rules
                   {track_filter}
             )
             SELECT
@@ -1200,21 +1299,18 @@ class DuckDBClient:
             GROUP BY track_id
             ORDER BY v85_ms DESC
         """
-        df = self.conn.execute(query, (start_time, end_time)).df()
-        if df.empty:
-            return []
-
-        result = []
-        for _, row in df.iterrows():
-            result.append({
+        rows = _to_dicts(self.conn.execute(query, (start_time, end_time)))
+        return [
+            {
                 "track_id":       int(row["track_id"]),
                 "class_label":    row["class_label"],
                 "v85_speed_kmh":  round(float(row["v85_ms"]) * 3.6, 1),
                 "mean_speed_kmh": round(float(row["mean_ms"]) * 3.6, 1),
                 "max_speed_kmh":  round(float(row["max_ms"]) * 3.6, 1),
                 "data_points":    int(row["data_points"]),
-            })
-        return result
+            }
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Vehicle count by time period
@@ -1253,22 +1349,17 @@ class DuckDBClient:
             GROUP BY period_start
             ORDER BY period_start
         """
-        df = self.conn.execute(query, (start_time, end_time)).df()
-        if df.empty:
-            return []
-
+        rows = _to_dicts(self.conn.execute(query, (start_time, end_time)))
         hourly_factor = 3600.0 / pf
-        result = []
-        for _, row in df.iterrows():
-            ps = float(row["period_start"])
-            cnt = int(row["vehicle_count"])
-            result.append({
-                "period_start_s":    round(ps, 1),
-                "period_end_s":      round(ps + pf, 1),
-                "vehicle_count":     cnt,
-                "vehicles_per_hour": round(cnt * hourly_factor, 1),
-            })
-        return result
+        return [
+            {
+                "period_start_s":    round(float(row["period_start"]), 1),
+                "period_end_s":      round(float(row["period_start"]) + pf, 1),
+                "vehicle_count":     int(row["vehicle_count"]),
+                "vehicles_per_hour": round(int(row["vehicle_count"]) * hourly_factor, 1),
+            }
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Queue / congestion detection
@@ -1318,22 +1409,23 @@ class DuckDBClient:
             FROM vehicle_trajectories
             WHERE timestamp >= ?
               AND timestamp <= ?
+              AND trusted_for_rules
               AND (vel_x * vel_x + vel_y * vel_y) < {spd_sq}
             GROUP BY bucket
             HAVING slow_count >= ?
             ORDER BY bucket
         """
-        df = self.conn.execute(query, (start_time, end_time, min_vehicles)).df()
-        if df.empty:
+        rows = _to_dicts(self.conn.execute(query, (start_time, end_time, min_vehicles)))
+        if not rows:
             return []
 
         # Merge adjacent buckets (gap ≤ 1 bucket apart) into episodes
         episodes = []
-        ep_start = ep_end = float(df.iloc[0]["bucket"])
-        peak = mean_acc = int(df.iloc[0]["slow_count"])
+        ep_start = ep_end = float(rows[0]["bucket"])
+        peak = mean_acc = int(rows[0]["slow_count"])
         count_in_ep = 1
 
-        for _, row in df.iloc[1:].iterrows():
+        for row in rows[1:]:
             bucket = float(row["bucket"])
             slow = int(row["slow_count"])
             if bucket - ep_end <= pf * 1.5:  # contiguous
@@ -1428,13 +1520,10 @@ class DuckDBClient:
             GROUP BY e.origin_gate, x.dest_gate, c.class_label
             ORDER BY vehicle_count DESC
         """
-        df = self.conn.execute(
+        return _to_dicts(self.conn.execute(
             query,
             (start_time, end_time, start_time, end_time, start_time, end_time),
-        ).df()
-        if df.empty:
-            return []
-        return df.to_dict(orient="records")
+        ))
 
     def close(self) -> None:
         """Flushes any remaining buffered rows and closes the database connection."""

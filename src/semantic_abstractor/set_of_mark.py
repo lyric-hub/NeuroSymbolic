@@ -209,6 +209,63 @@ def draw_zone_overlay(
 
 
 # ---------------------------------------------------------------------
+# Vehicle ID Renderer  (default SoM renderer)
+# ---------------------------------------------------------------------
+
+
+class VehicleIdRenderer(BaseRenderer):
+    """Draws only the track ID above each vehicle's bounding box.
+
+    Intent: give the VLM the minimum visual information it needs to refer
+    to vehicles by ID — nothing else.  No bounding boxes, no centroid
+    dots, no corner ticks.  A small dark background pill behind the
+    white text ensures legibility on any background.
+    """
+
+    _FONT       = cv2.FONT_HERSHEY_SIMPLEX
+    _FONT_SCALE = 0.55
+    _THICKNESS  = 1
+    _PAD        = 3
+
+    def render(self, frame: np.ndarray, context: RenderContext) -> None:
+        for track in context.tracks:
+            if (
+                context.zone_occupant_ids is not None
+                and track.track_id not in context.zone_occupant_ids
+            ):
+                continue
+            self._draw_id(frame, track)
+
+    def _draw_id(self, frame: np.ndarray, track: TrackState) -> None:
+        label = str(track.track_id)
+        x1, y1, x2, _ = track.box
+
+        (tw, th), _ = cv2.getTextSize(
+            label, self._FONT, self._FONT_SCALE, self._THICKNESS
+        )
+
+        # Centre the label above the top edge of the bbox.
+        # Clamp lx so the background pill stays within the left frame edge.
+        cx    = (x1 + x2) // 2
+        lx    = max(self._PAD, cx - tw // 2)
+        ly    = max(y1 - 4, th + self._PAD + 2)
+
+        # Dark background pill.
+        bx1 = lx - self._PAD
+        by1 = ly - th - self._PAD
+        bx2 = lx + tw + self._PAD
+        by2 = ly + self._PAD
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (30, 30, 30), -1)
+
+        # White text.
+        cv2.putText(
+            frame, label, (lx, ly),
+            self._FONT, self._FONT_SCALE,
+            (255, 255, 255), self._THICKNESS, cv2.LINE_AA,
+        )
+
+
+# ---------------------------------------------------------------------
 # Ultra-Minimal Renderer
 # ---------------------------------------------------------------------
 

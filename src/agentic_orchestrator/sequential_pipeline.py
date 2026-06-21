@@ -46,15 +46,18 @@ Symbolic: Savitzky-Golay + homography + Kùzu graph + DuckDB + ZoneManager +
           TrafficRuleEngine (explicit, deterministic, auditable rules)
 """
 
+import os
 import uuid
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
+
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage  # HumanMessage used in initialize
 
 from .langgraph_state import AgentState
-from .hierarchical_router import _classify_intent
 from .tools import (
     search_semantic_events,
     search_entity_profiles,
@@ -108,153 +111,264 @@ TOOLS_FULL = [
 TOOLS_SEMANTIC = [search_semantic_events, search_entity_profiles]
 
 # ---------------------------------------------------------------------------
-# System prompts — tailored per intent class.
+# System prompt building
 # ---------------------------------------------------------------------------
-_SYSTEM_PROMPT_FULL = """You are an expert traffic safety analyst with access to a \
-Neuro-Symbolic analysis system.
+# Per-plan system prompts expose only the 3–6 tool descriptions relevant to
+# the active plan rather than all 19.  This reduces token usage by ~70% per
+# request, which is critical for staying within API token-per-day limits.
+# ---------------------------------------------------------------------------
 
-Available tools:
-1. search_semantic_events      — Semantic search over VLM-generated EVENT descriptions (Milvus).
-                                 Finds specific events in specific time windows.
-                                 Returns time_window_pointer (e.g. '10.0-15.0') for further queries.
-                                 Use for: "what happened at t=10s?", "find a near-miss event".
+_TOOL_CALL_MANDATE = (
+    "MANDATORY RULE: You MUST call at least one tool before producing any answer. "
+    "Never write a final answer without first calling a tool. "
+    "If the tool returns no data, state that and stop — do not invent facts. "
+    "Follow the Analysis Plan step by step, calling each tool in order.\n\n"
+)
 
-2. search_entity_profiles      — Behavioral profile search over per-VEHICLE longitudinal summaries.
-                                 Searches summaries accumulated over the full video.
-                                 Use for: "which vehicle was most aggressive?", "find the speeder",
-                                 "which vehicle hard-braked the most throughout the video?".
-                                 Returns: track_id, summary, first_seen, last_seen.
+_TOOL_DESCRIPTIONS: dict = {
+    "search_semantic_events": (
+        "search_semantic_events — Semantic search over VLM-generated EVENT descriptions (Milvus). "
+        "Finds specific events in specific time windows. "
+        "Returns time_window_pointer (e.g. '10.0-15.0') for further queries. "
+        "Use for: 'what happened at t=10s?', 'find a near-miss event'."
+    ),
+    "search_entity_profiles": (
+        "search_entity_profiles — Behavioral profile search over per-VEHICLE longitudinal summaries. "
+        "Searches summaries accumulated over the full video. "
+        "Use for: 'which vehicle was most aggressive?', 'find the speeder', "
+        "'which vehicle hard-braked the most throughout the video?'. "
+        "Returns: track_id, summary, first_seen, last_seen."
+    ),
+    "query_graph_relationships": (
+        "query_graph_relationships — Structural graph query (Kùzu, Cypher). "
+        "Use the time_window from search_semantic_events to find which entities interacted. "
+        "Node labels: Vehicle, Pedestrian, Infrastructure. "
+        "Example: MATCH (s)-[r:INTERACTS_WITH]->(o) "
+        "WHERE r.trajectory_time_window = '10.0-15.0' RETURN s.name, r.predicate, o.name"
+    ),
+    "verify_physics_math": (
+        "verify_physics_math — Raw kinematic statistics (DuckDB). "
+        "Returns max speed and minimum signed acceleration for a window. "
+        "Use for quick numeric lookups or cross-checking rule engine results."
+    ),
+    "evaluate_traffic_rules": (
+        "evaluate_traffic_rules — Symbolic Rule Engine (deterministic, auditable). "
+        "Checks for violations: speeding, hard braking, aggressive acceleration. "
+        "Each result includes exact evidence values. "
+        "Always cite the 'evidence' field in your final answer."
+    ),
+    "query_zone_flow": (
+        "query_zone_flow — Zone entry/exit counts and OD (Origin-Destination) pairs. "
+        "Use for flow, counts, gate entry/exit, dwell time, OD matrix."
+    ),
+    "search_vehicles_by_type": (
+        "search_vehicles_by_type — Find all track_ids of a given vehicle class. "
+        "Call FIRST when the query mentions a vehicle type: "
+        "'motorcycle', 'car', 'bus', 'truck', 'bicycle', 'person'. "
+        "For 'two-wheelers': call twice — 'motorcycle' then 'bicycle'. "
+        "Returns track_ids to pass to verify_physics_math and evaluate_traffic_rules."
+    ),
+    "get_vehicle_trajectory": (
+        "get_vehicle_trajectory — Full spatial path reconstruction for one vehicle. "
+        "Returns sampled (timestamp, pos_x, pos_y, speed, nearest_landmark). "
+        "Use when you need WHERE a vehicle was at each moment, not just peak speed."
+    ),
+    "get_vehicle_proximity": (
+        "get_vehicle_proximity — Tail-to-head gap between two vehicles (NOT centre-to-centre). "
+        "gap = centre_distance - half_length_A - half_length_B. "
+        "gap ≤ 0 → collision_confirmed=true. "
+        "Returns min_gap_m, collision_confirmed, timestamp_s, both vehicle positions."
+    ),
+    "compare_vehicle_kinematics": (
+        "compare_vehicle_kinematics — Side-by-side kinematic stats for multiple vehicles. "
+        "Pass track_ids_csv e.g. '4,9' to get stats for both simultaneously. "
+        "Use instead of calling verify_physics_math twice for incident comparisons."
+    ),
+    "get_vehicle_data_at_interval": (
+        "get_vehicle_data_at_interval — Fixed-rate snapshots of all vehicles at regular intervals. "
+        "Use after detect_traffic_queue to find vehicle positions during a congestion episode."
+    ),
+    "compute_ttc": (
+        "compute_ttc — Time-to-Collision (TTC) between two vehicles. "
+        "TTC = gap / closing_speed. Only defined when vehicles are approaching. "
+        "Conflict levels: CRITICAL < 1.5 s, SERIOUS < 3.0 s, LOW ≥ 3.0 s. "
+        "Use AFTER get_vehicle_proximity confirms vehicles were close. "
+        "Returns min_ttc_s, conflict_level, gap_at_min_ttc_m, closing_speed_ms."
+    ),
+    "get_speed_statistics": (
+        "get_speed_statistics — 85th-percentile speed (V85), mean, and max speed. "
+        "V85 is the standard road safety / speed limit review metric. "
+        "Use for: 'what is the 85th percentile speed?', 'are vehicles speeding?' "
+        "Pass track_id=-1 for all vehicles, ≥0 for a specific vehicle."
+    ),
+    "get_vehicle_count_report": (
+        "get_vehicle_count_report — Vehicle count and flow rate per time period. "
+        "Use for: 'how many vehicles per hour?', 'when was peak traffic?' "
+        "Use period_secs=900 for 15-min buckets (PHF analysis). "
+        "Returns vehicles_per_hour for each bucket."
+    ),
+    "detect_traffic_queue": (
+        "detect_traffic_queue — Queue / congestion episode detection. "
+        "Finds time windows where ≥ N vehicles are simultaneously near-stationary. "
+        "Use for: 'was there a queue?', 'how long did congestion last?'"
+    ),
+    "get_turning_movement_counts": (
+        "get_turning_movement_counts — Gate-level TMC matrix. "
+        "Pairs entry gate with exit gate per vehicle to produce turn counts. "
+        "Use for: 'how many turned left from North?', 'what is the dominant movement?' "
+        "Requires zone_config.json with named gates."
+    ),
+    "get_data_quality_report": (
+        "get_data_quality_report — ALWAYS call before citing rule violations. "
+        "Returns real vs interpolated frame counts, YOLO confidence, "
+        "gate crossing confidence, and a quality rating (HIGH/MEDIUM/LOW). "
+        "If rating is LOW, state findings as indicative not confirmed."
+    ),
+    "explain_threshold": (
+        "explain_threshold — Call when the user asks WHY a threshold was chosen. "
+        "Returns the engineering standard / source citation for any rule. "
+        "E.g. explain_threshold('HARD_BRAKING') → cites the source standard."
+    ),
+    "link_violation_to_conflict": (
+        "link_violation_to_conflict — Call AFTER confirming both a violation and a conflict exist "
+        "and you are confident one caused the other. "
+        "Writes a permanent CAUSES edge to the Kùzu graph."
+    ),
+    "get_reasoning_trace": (
+        "get_reasoning_trace — Call when user asks 'how did you reach that conclusion?' "
+        "Retrieves the full tool-call audit log for a prior session."
+    ),
+}
 
-3. query_graph_relationships   — Structural graph query (Kùzu, Cypher).
-                                 Use the time_window from tool 1 to find which entities interacted.
-                                 Node labels: Vehicle, Pedestrian, Infrastructure.
-                                 Example: MATCH (s)-[r:INTERACTS_WITH]->(o)
-                                          WHERE r.trajectory_time_window = '10.0-15.0'
-                                          RETURN s.name, r.predicate, o.name
+_PLAN_DECISION_RULES: dict = {
+    "behavioral": (
+        "Call search_entity_profiles first to find the vehicle matching the description. "
+        "Then call verify_physics_math to confirm kinematic evidence. "
+        "Then call evaluate_traffic_rules for formal violation verdicts. "
+        "Always call get_data_quality_report before citing rule violations."
+    ),
+    "vehicle_type": (
+        "Call search_vehicles_by_type first with the requested class (e.g. 'motorcycle'). "
+        "For two-wheelers call it twice: 'motorcycle' then 'bicycle'. "
+        "Then call verify_physics_math and evaluate_traffic_rules per track_id. "
+        "Always call get_data_quality_report before citing rule violations."
+    ),
+    "conflict": (
+        "Call search_semantic_events first to find the conflict event and time window. "
+        "Then call query_graph_relationships to identify the involved vehicles. "
+        "Then call get_vehicle_proximity to confirm minimum gap. "
+        "Then call compute_ttc for conflict severity. "
+        "Always call get_data_quality_report before citing findings."
+    ),
+    "incident": (
+        "Follow the Analysis Plan step by step. "
+        "Start with search_semantic_events to find the incident time window. "
+        "Then query_graph_relationships to find involved vehicles. "
+        "Then compare_vehicle_kinematics for pre-accident and incident windows. "
+        "Then get_vehicle_proximity to confirm closest approach. "
+        "Then evaluate_traffic_rules for each vehicle. "
+        "Always call get_data_quality_report before citing rule violations."
+    ),
+    "vehicle_specific": (
+        "Call search_semantic_events first to find events involving this vehicle. "
+        "Then verify_physics_math for kinematic statistics. "
+        "Then evaluate_traffic_rules to check for violations. "
+        "Then query_graph_relationships for interactions with other vehicles. "
+        "Always call get_data_quality_report before citing rule violations."
+    ),
+    "turning_movements": (
+        "Call get_turning_movement_counts to get the full TMC matrix. "
+        "Then call query_zone_flow for supplementary dwell times and gate counts."
+    ),
+    "speed_compliance": (
+        "Call get_speed_statistics with track_id=-1 to get V85, mean, max for all vehicles. "
+        "Then call evaluate_traffic_rules for vehicles whose speed exceeds the limit. "
+        "Always call get_data_quality_report before citing rule violations."
+    ),
+    "flow": (
+        "Call query_zone_flow to get gate counts and OD pairs."
+    ),
+    "volume": (
+        "Call get_vehicle_count_report with period_secs=900 for 15-min PHF buckets. "
+        "Then call get_vehicle_count_report with period_secs=3600 for hourly volumes."
+    ),
+    "queue": (
+        "Call detect_traffic_queue to find congestion episodes. "
+        "Then call get_vehicle_data_at_interval at each episode start/end for vehicle positions. "
+        "Then call get_vehicle_count_report to correlate queue episodes with traffic volume."
+    ),
+    "relational": (
+        "Call search_semantic_events to find the relevant time window. "
+        "Then call query_graph_relationships to find which vehicles interacted. "
+        "Then call verify_physics_math for the involved vehicles."
+    ),
+    "default": (
+        "Call search_semantic_events to find relevant events. "
+        "Then search_entity_profiles to find relevant vehicle profiles. "
+        "Then verify_physics_math for any identified vehicles. "
+        "Then evaluate_traffic_rules if violations are suspected."
+    ),
+}
 
-4. verify_physics_math         — Raw kinematic statistics (DuckDB).
-                                 Returns max speed and minimum signed acceleration for a window.
-                                 Use for quick numeric lookups or cross-checking rule engine results.
+_OUTPUT_FORMAT = """\
+REQUIRED OUTPUT FORMAT — write your final answer in plain, readable prose.
 
-5. evaluate_traffic_rules      — Symbolic Rule Engine (deterministic, auditable).
-                                 Use this to CHECK FOR VIOLATIONS: speeding, hard braking,
-                                 aggressive acceleration. Each result includes exact evidence values.
-                                 Always cite the 'evidence' field in your final answer.
+Rules:
+- Do NOT paste raw JSON or tool output. Extract only the key numbers and facts.
+- Do NOT use the words "FINDING:", "EVIDENCE:", "CONFIDENCE:" as headers.
+  Instead write naturally: start with a direct answer, then support it.
+- Use markdown: **bold** for vehicle IDs and key values, bullet lists for \
+multiple items, ### for section headings if the answer is long.
+- Keep it concise. One short paragraph per vehicle or topic is enough.
+- Always state the speed limit when reporting speed violations.
+- If no violations were found, say so in one sentence.
+- End with a one-line confidence statement in italics: \
+*Confidence: HIGH — based on [source].*
 
-6. query_zone_flow             — Zone entry/exit counts and OD (Origin-Destination) pairs.
-                                 Use for flow, counts, gate entry/exit, dwell time, OD matrix.
+Example of good style:
+**Vehicle 4** was speeding at **55.8 km/h** (limit: 50 km/h) for 65% of its \
+observed time, and hard-braked at **−3.5 m/s²** (threshold: −3.0 m/s²) near \
+t=29s. No other violations were detected.
+*Confidence: HIGH — kinematic data, 1089 trusted frames.*"""
 
-7. search_vehicles_by_type     — Find all track_ids of a given vehicle class.
-                                 Use FIRST when the query mentions a vehicle type:
-                                 "motorcycle", "car", "bus", "truck", "bicycle", "person".
-                                 For "two-wheelers": call twice — "motorcycle" + "bicycle".
-                                 Returns track_ids to use with tools 4 and 5.
 
-8. get_vehicle_trajectory      — Full spatial path reconstruction for one vehicle.
-                                 Returns sampled (timestamp, pos_x, pos_y, speed, nearest_landmark).
-                                 Use when you need to know WHERE a vehicle was at each moment,
-                                 not just peak speed. E.g. "was it in the intersection when it braked?"
+def _build_plan_system_prompt(plan_key: str) -> str:
+    """
+    Builds a minimal system prompt containing only the tool descriptions for
+    the tools bound to the given plan.  Falls back to describing all tools
+    when plan_key is unknown.
 
-9. get_vehicle_proximity       — Tail-to-head gap between two vehicles (NOT centre-to-centre).
-                                 gap = centre_distance - half_length_A - half_length_B.
-                                 gap ≤ 0 → collision_confirmed=true.
-                                 Use to answer "did they actually collide?" after identifying involved vehicles.
-                                 Returns min_gap_m, collision_confirmed, timestamp_s, both vehicle positions.
+    Reduces token usage by ~70% compared to always sending all 19 descriptions.
+    """
+    tools_in_plan = _PLAN_TOOLS.get(plan_key)
+    if tools_in_plan is None:
+        tool_names = list(_TOOL_DESCRIPTIONS.keys())
+    else:
+        tool_names = [t.name for t in tools_in_plan]
 
-10. compare_vehicle_kinematics — Side-by-side kinematic stats for multiple vehicles.
-                                 Pass track_ids_csv e.g. "4,9" to get stats for both simultaneously.
-                                 Use instead of calling verify_physics_math twice for incident comparisons.
+    tool_block = "\n\n".join(
+        f"{i + 1}. {_TOOL_DESCRIPTIONS[name]}"
+        for i, name in enumerate(tool_names)
+        if name in _TOOL_DESCRIPTIONS
+    )
+    decision_rule = _PLAN_DECISION_RULES.get(
+        plan_key,
+        "Follow the Analysis Plan step by step. "
+        "Always cite the tool output that supports each claim. "
+        "Base your answer strictly on what the tools returned.",
+    )
+    return (
+        _TOOL_CALL_MANDATE
+        + "You are an expert traffic safety analyst with access to a "
+        "Neuro-Symbolic analysis system.\n\n"
+        + f"Available tools:\n{tool_block}\n\n"
+        + f"Decision rule: {decision_rule}\n\n"
+        + _OUTPUT_FORMAT
+    )
 
-11. compute_ttc               — Time-to-Collision (TTC) between two vehicles.
-                                 TTC = gap / closing_speed. Only defined when vehicles are approaching.
-                                 Conflict levels: CRITICAL < 1.5 s, SERIOUS < 3.0 s, LOW ≥ 3.0 s.
-                                 Use AFTER get_vehicle_proximity confirms vehicles were close.
-                                 Returns min_ttc_s, conflict_level, gap_at_min_ttc_m, closing_speed_ms.
 
-12. get_speed_statistics      — 85th-percentile speed (V85), mean, and max speed.
-                                 V85 is the standard road safety / speed limit review metric.
-                                 Use for: "what is the 85th percentile speed?", "are vehicles speeding?"
-                                 Pass track_id=-1 for all vehicles, ≥0 for a specific vehicle.
-
-13. get_vehicle_count_report  — Vehicle count and flow rate per time period.
-                                 Use for: "how many vehicles per hour?", "when was peak traffic?"
-                                 Use period_secs=900 for 15-min buckets (PHF analysis).
-                                 Returns vehicles_per_hour for each bucket.
-
-14. detect_traffic_queue      — Queue / congestion episode detection.
-                                 Finds time windows where ≥ N vehicles are simultaneously near-stationary.
-                                 Use for: "was there a queue?", "how long did congestion last?"
-                                 After finding episodes, use get_vehicle_data_at_interval for positions.
-
-15. get_turning_movement_counts — Gate-level TMC matrix.
-                                 Pairs entry gate with exit gate per vehicle to produce turn counts.
-                                 Use for: "how many vehicles turned left from North?", "what is the
-                                 dominant movement?" Requires zone_config.json with named gates.
-
-Decision rules:
-- Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
-- Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5.
-- Relational questions ("which vehicles interacted?"): tools 1 → 3.
-- Combined safety + relationships: tools 1 → 3 → 5.
-- Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
-- Flow/count/OD questions: tool 6 directly.
-- Vehicle-type questions ("behaviour of motorcycles"): tool 7 → tools 4 + 5 per track_id.
-- TTC / conflict severity: tool 8 (proximity) → tool 11 (TTC) for full conflict picture.
-- Speed compliance / V85: tool 12 for all vehicles, then tool 5 per flagged vehicle.
-- Traffic volume / peak hour: tool 13 directly.
-- Queue / congestion: tool 14 to find episodes, then tool 10 for vehicle positions inside.
-- Turning movements / intersection flow: tool 15 directly.
-16. get_data_quality_report    — ALWAYS call before citing rule violations.
-                                 Returns real vs interpolated frame counts, YOLO confidence,
-                                 gate crossing confidence, and a quality rating (HIGH/MEDIUM/LOW).
-                                 If rating is LOW, state findings as indicative not confirmed.
-
-17. explain_threshold          — Call when the user asks WHY a threshold was chosen.
-                                 Returns the engineering standard / source citation for any rule.
-                                 E.g. "Why is hard braking 4 m/s²?" → explain_threshold("HARD_BRAKING")
-
-18. link_violation_to_conflict — Call AFTER confirm both a violation and a conflict exist
-                                 and you are confident one caused the other.
-                                 Writes a permanent CAUSES edge to the Kùzu graph.
-
-19. get_reasoning_trace        — Call when user asks "how did you reach that conclusion?"
-                                 Retrieves the full tool-call audit log for a prior session.
-
-Decision rules:
-- Global behavioral questions ("most aggressive", "which vehicle sped the most"): tool 2.
-- Safety/violation questions ("did vehicle 4 brake hard?"): tools 1 → 5 → 16 (quality check).
-- Relational questions ("which vehicles interacted?"): tools 1 → 3.
-- Combined safety + relationships: tools 1 → 3 → 5.
-- Full incident reconstruction: tools 1 → 3 → 5 → 4 (raw stats for extra context).
-- Flow/count/OD questions: tool 6 directly.
-- Vehicle-type questions ("behaviour of motorcycles"): tool 7 → tools 4 + 5 per track_id.
-- TTC / conflict severity: tool 8 (proximity) → tool 11 (TTC) for full conflict picture.
-- Speed compliance / V85: tool 12 for all vehicles, then tool 5 per flagged vehicle.
-- Traffic volume / peak hour: tool 13 directly.
-- Queue / congestion: tool 14 to find episodes, then tool 10 for vehicle positions inside.
-- Turning movements / intersection flow: tool 15 directly.
-- Causal attribution ("who caused the accident?"): tools 1→3→5→8→11→18 to write CAUSES edge.
-- "Why this threshold?": tool 17 (explain_threshold).
-- "How did you reach that conclusion?": tool 19 (get_reasoning_trace).
-- Always call tool 16 (get_data_quality_report) before citing evaluate_traffic_rules findings.
-- Always cite the tool output that supports each claim in your final answer.
-- Base your final answer strictly on what the tools returned. Do not invent facts.
-
-REQUIRED OUTPUT FORMAT — structure every final answer as follows:
-
-FINDING: [one sentence conclusion]
-EVIDENCE:
-  - [tool name] → [specific value or quote from tool output]
-  - ...
-CONFIDENCE: HIGH | MEDIUM | LOW
-  (HIGH = ≥2 symbolic tools corroborate AND data quality HIGH;
-   MEDIUM = 1 tool or partial data or MEDIUM quality;
-   LOW = VLM-only or LOW quality data)
-ASSUMPTIONS: [list from _assumptions fields in tool outputs, or "None"]
-DATA QUALITY: [coverage_pct% real frames, mean confidence, rating from get_data_quality_report]
-ALTERNATIVE INTERPRETATION: [one plausible alternative if evidence is ambiguous, or "None"]"""
-
-_SYSTEM_PROMPT_SEMANTIC = """You are an expert traffic safety analyst.
+_SYSTEM_PROMPT_SEMANTIC = _TOOL_CALL_MANDATE + \
+"""You are an expert traffic safety analyst.
 
 You have two tools available:
 1. search_semantic_events  — Searches VLM-generated event descriptions (frame-level).
@@ -276,7 +390,7 @@ _PLAN_TEMPLATES = {
     "vehicle_type": {
         "keywords": [
             "motorcycle", "two-wheel", "bicycle", "bike",
-            "buses", "trucks", "pedestrian", "person",
+            "bus", "buses", "truck", "trucks", "pedestrian", "person",
             "vehicle type", "vehicles by type",
         ],
         "plan": (
@@ -287,34 +401,42 @@ _PLAN_TEMPLATES = {
             "4. Summarise behaviour patterns across all vehicles of this type."
         ),
     },
+    # conflict is checked before incident so "time-to-collision" (which contains
+    # "collision") routes to the conflict plan rather than the incident plan.
+    "conflict": {
+        "keywords": [
+            "ttc", "time to collision", "time-to-collision", "close call",
+            "how close", "dangerous gap", "separation", "closest",
+            "conflict severity", "minimum gap",
+            "tailgat", "following distance", "headway",
+        ],
+        "plan": (
+            "1. Call search_semantic_events to find the conflict event and time window.\n"
+            "2. Call query_graph_relationships to identify the two involved vehicles.\n"
+            "3. Call get_vehicle_proximity to confirm minimum gap and whether collision occurred.\n"
+            "4. Call compute_ttc for the same vehicles and window to get conflict severity level.\n"
+            "5. Synthesise: gap + TTC together give the full conflict picture."
+        ),
+    },
     "incident": {
+        # "t=" and "why" removed — too broad, captured trajectory and threshold queries.
+        # "cause" removed — too broad, now covered by more specific phrases.
         "keywords": [
             "incident", "collision", "crash", "near-miss", "near miss",
-            "accident", "happened at", "t=", "what happened", "reason",
-            "cause", "why", "led to", "before the",
+            "accident", "happened at", "what happened", "reason",
+            "led to", "before the",
         ],
         "plan": (
             "1. Call search_semantic_events to find the incident and its time_window_pointer (e.g. '10.0-15.0').\n"
             "2. Call query_graph_relationships to find which vehicles interacted at that window:\n"
-            "   MATCH (s)-[r:INTERACTS_WITH]->(o) WHERE r.trajectory_time_window = '<window>' RETURN s.name, r.predicate, o.name, r.motion_state, r.phase\n"
+            "   MATCH (s)-[r:INTERACTS_WITH]->(o) WHERE r.trajectory_time_window = 'WINDOW_VALUE' RETURN s.name, r.predicate, o.name, r.motion_state, r.phase\n"
             "3. For each involved vehicle, traverse the PRECEDES chain to find pre-accident behaviour (up to 3 windows back):\n"
-            "   MATCH (v:Vehicle {name:'<name>'})-[r:PRECEDES*1..3]->(v2) WHERE r[-1].to_window = '<window>' RETURN r[*].from_window, r[*].to_window\n"
+            "   MATCH (v:Vehicle {name:'VEHICLE_NAME'})-[r:PRECEDES*1..3]->(v2) WHERE r[-1].to_window = 'WINDOW_VALUE' RETURN r[*].from_window, r[*].to_window\n"
             "4. Call compare_vehicle_kinematics with all involved vehicle IDs for the PRE-ACCIDENT window (start_time = incident_start - 15, end_time = incident_start) to compare speeds side-by-side.\n"
             "5. Call get_vehicle_proximity with the two closest vehicles for the INCIDENT window to find the minimum distance and time of closest approach.\n"
             "6. Call compare_vehicle_kinematics again for the INCIDENT window itself to confirm impact kinematics for all parties simultaneously.\n"
             "7. Call evaluate_traffic_rules for each involved vehicle over the full range (pre-accident + incident) to detect violations that preceded the crash.\n"
             "8. Synthesise: combine pre-accident behaviour, proximity data, rule violations, and impact kinematics to state the cause."
-        ),
-    },
-    "relational": {
-        "keywords": [
-            "interact", "relationship", "between", "conflict",
-            "following", "tailgat", "together",
-        ],
-        "plan": (
-            "1. Call search_semantic_events to find the relevant time window.\n"
-            "2. Call query_graph_relationships to find which vehicles interacted.\n"
-            "3. Call verify_physics_math for the involved vehicles."
         ),
     },
     "behavioral": {
@@ -328,6 +450,8 @@ _PLAN_TEMPLATES = {
             "3. Call evaluate_traffic_rules for formal violation verdicts."
         ),
     },
+    # vehicle_specific is checked before relational so "Vehicle 4 interact with"
+    # routes to vehicle_specific rather than relational.
     "vehicle_specific": {
         "keywords": ["vehicle ", "track id", "track_id"],
         "plan": (
@@ -337,19 +461,26 @@ _PLAN_TEMPLATES = {
             "4. Call query_graph_relationships to find interactions with other vehicles."
         ),
     },
-    "flow": {
+    # turning_movements is checked before flow to prevent "count" in flow from
+    # capturing turning movement count queries (TMC matrix).
+    "turning_movements": {
         "keywords": [
-            "flow", "count", "zone", "gate", "entry", "exit",
-            "od matrix", "origin", "destination", "how many vehicles", "dwell",
+            "turning", "turn", "left turn", "right turn", "u-turn",
+            "tmc", "approach", "departure", "intersection movement",
+            "dominant movement", "turning count", "movement count",
         ],
         "plan": (
-            "1. Call query_zone_flow to get gate counts and OD pairs."
+            "1. Call get_turning_movement_counts to get the full TMC matrix.\n"
+            "2. Identify dominant movements and any unexpected movements (e.g. U-turns).\n"
+            "3. Call query_zone_flow for dwell times and gate counts to supplement TMC."
         ),
     },
     "speed_compliance": {
         "keywords": [
             "85th", "v85", "percentile", "speed limit", "compliance",
             "average speed", "mean speed", "typical speed",
+            "speeding", "over the limit", "exceed", "over limit",
+            "speed violation", "were speeding", "is speeding",
         ],
         "plan": (
             "1. Call get_speed_statistics (track_id=-1) to get V85, mean, max for all vehicles.\n"
@@ -357,10 +488,23 @@ _PLAN_TEMPLATES = {
             "3. Summarise compliance: percentage of vehicles within limit, V85 vs posted limit."
         ),
     },
+    "flow": {
+        # "count" and "how many vehicles" removed — too broad.
+        # "count" captured turning movement count queries; "how many vehicles"
+        # captured volume queries.  Zone/gate-specific keywords are sufficient.
+        "keywords": [
+            "flow", "zone", "gate", "entry", "exit",
+            "od matrix", "origin", "destination", "dwell",
+        ],
+        "plan": (
+            "1. Call query_zone_flow to get gate counts and OD pairs."
+        ),
+    },
     "volume": {
         "keywords": [
             "volume", "how many", "count per", "per hour", "per minute",
-            "peak hour", "traffic count", "phf", "aadt",
+            "peak hour", "peak traffic", "traffic count", "traffic volume",
+            "phf", "aadt",
         ],
         "plan": (
             "1. Call get_vehicle_count_report with period_secs=900 (15-min buckets) for PHF.\n"
@@ -380,28 +524,19 @@ _PLAN_TEMPLATES = {
             "3. Call get_vehicle_count_report to correlate queue episodes with traffic volume."
         ),
     },
-    "turning_movements": {
+    # relational is last — keywords like "interact" and "following" are common
+    # words that appear in many query types; checking more-specific templates first
+    # prevents false matches.
+    "relational": {
+        # "conflict" removed — belongs to the conflict template.
+        # "between" removed — too broad, appears in trajectory and conflict queries.
         "keywords": [
-            "turning", "turn", "left turn", "right turn", "through", "u-turn",
-            "tmc", "approach", "departure", "intersection movement",
+            "interact", "relationship", "following", "tailgat", "together",
         ],
         "plan": (
-            "1. Call get_turning_movement_counts to get the full TMC matrix.\n"
-            "2. Identify dominant movements and any unexpected movements (e.g. U-turns).\n"
-            "3. Call query_zone_flow for dwell times and gate counts to supplement TMC."
-        ),
-    },
-    "conflict": {
-        "keywords": [
-            "ttc", "time to collision", "conflict", "close call",
-            "how close", "dangerous gap", "separation",
-        ],
-        "plan": (
-            "1. Call search_semantic_events to find the conflict event and time window.\n"
-            "2. Call query_graph_relationships to identify the two involved vehicles.\n"
-            "3. Call get_vehicle_proximity to confirm minimum gap and whether collision occurred.\n"
-            "4. Call compute_ttc for the same vehicles and window to get conflict severity level.\n"
-            "5. Synthesise: gap + TTC together give the full conflict picture."
+            "1. Call search_semantic_events to find the relevant time window.\n"
+            "2. Call query_graph_relationships to find which vehicles interacted.\n"
+            "3. Call verify_physics_math for the involved vehicles."
         ),
     },
 }
@@ -414,24 +549,118 @@ _DEFAULT_PLAN = (
 )
 
 
-def _select_plan(query: str) -> str:
+def _select_plan(query: str) -> tuple:
     """
-    Deterministic keyword matcher — returns the first matching plan template.
-    Falls back to _DEFAULT_PLAN if no keywords match.
+    Deterministic keyword matcher.
+    Returns (plan: str, plan_key: str).
+    Falls back to (_DEFAULT_PLAN, 'default') if no keywords match.
     """
     q = query.lower()
-    for template in _PLAN_TEMPLATES.values():
+    for key, template in _PLAN_TEMPLATES.items():
         if any(kw in q for kw in template["keywords"]):
-            return template["plan"]
-    return _DEFAULT_PLAN
+            return template["plan"], key
+    return _DEFAULT_PLAN, "default"
+
 
 # ---------------------------------------------------------------------------
-# LLM — two bindings: full (all 5 tools) and semantic (search only).
-# ChatOllama is required for bind_tools(); OllamaLLM is text-only.
+# Plan-scoped tool subsets.
+# Binding only 3–6 tools relevant to the selected plan dramatically reduces
+# the LLM's decision space compared to exposing all 20 tools at once.
+# The ToolNode still registers all tools so it can execute any call the LLM
+# makes regardless of which subset was bound.
 # ---------------------------------------------------------------------------
-llm = ChatOllama(model="gemma4:e2b", temperature=0.0)
+_PLAN_TOOLS: dict = {
+    "vehicle_type": [
+        search_vehicles_by_type, verify_physics_math,
+        evaluate_traffic_rules, get_data_quality_report, get_speed_statistics,
+    ],
+    "conflict": [
+        search_semantic_events, query_graph_relationships,
+        get_vehicle_proximity, compute_ttc,
+        link_violation_to_conflict, get_data_quality_report,
+    ],
+    "incident": [
+        search_semantic_events, query_graph_relationships,
+        compare_vehicle_kinematics, get_vehicle_proximity,
+        evaluate_traffic_rules, link_violation_to_conflict, get_data_quality_report,
+    ],
+    "behavioral": [
+        search_entity_profiles, verify_physics_math,
+        evaluate_traffic_rules, get_data_quality_report,
+    ],
+    "vehicle_specific": [
+        search_semantic_events, verify_physics_math,
+        evaluate_traffic_rules, query_graph_relationships,
+        get_vehicle_trajectory, get_data_quality_report,
+    ],
+    "turning_movements": [
+        get_turning_movement_counts, query_zone_flow,
+    ],
+    "speed_compliance": [
+        get_speed_statistics, evaluate_traffic_rules,
+        explain_threshold, get_data_quality_report,
+    ],
+    "flow": [
+        query_zone_flow, get_turning_movement_counts,
+    ],
+    "volume": [
+        get_vehicle_count_report, query_zone_flow,
+    ],
+    "queue": [
+        detect_traffic_queue, get_vehicle_data_at_interval,
+        get_vehicle_count_report,
+    ],
+    "relational": [
+        search_semantic_events, query_graph_relationships,
+        verify_physics_math, get_vehicle_proximity, get_data_quality_report,
+    ],
+    "default": [
+        search_semantic_events, search_entity_profiles,
+        verify_physics_math, evaluate_traffic_rules,
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# LLM — provider selected by AGENT_LLM_PROVIDER env var.
+#
+#   AGENT_LLM_PROVIDER=ollama  (local Ollama, no API key required)
+#     AGENT_MODEL=gemma4:e2b   (or any model pulled in Ollama)
+#
+#   AGENT_LLM_PROVIDER=openai  (default — any OpenAI-compatible API)
+#     AGENT_API_KEY=<key>
+#     AGENT_API_BASE_URL=https://api.groq.com/openai/v1
+#     AGENT_MODEL=llama-3.3-70b-versatile
+# ---------------------------------------------------------------------------
+_LLM_PROVIDER = os.environ.get("AGENT_LLM_PROVIDER", "openai")
+_AGENT_MODEL  = os.environ.get("AGENT_MODEL", "llama-3.3-70b-versatile")
+
+if _LLM_PROVIDER == "ollama":
+    from langchain_ollama import ChatOllama
+    llm = ChatOllama(model=_AGENT_MODEL, temperature=0.0)
+else:
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(
+        model=_AGENT_MODEL,
+        api_key=os.environ.get("AGENT_API_KEY", ""),
+        base_url=os.environ.get("AGENT_API_BASE_URL", "https://api.groq.com/openai/v1"),
+        temperature=0.0,
+        max_retries=3,
+        request_timeout=60,
+    )
 llm_full = llm.bind_tools(TOOLS_FULL)
 llm_semantic = llm.bind_tools(TOOLS_SEMANTIC)
+
+_plan_llm_cache: dict = {}
+
+
+def _get_plan_llm(plan_key: str):
+    """Returns a cached tool-bound LLM for the given plan key."""
+    if plan_key not in _plan_llm_cache:
+        tools = _PLAN_TOOLS.get(plan_key)
+        _plan_llm_cache[plan_key] = (
+            llm.bind_tools(tools) if tools else llm_full
+        )
+    return _plan_llm_cache[plan_key]
 
 
 # ---------------------------------------------------------------------------
@@ -440,28 +669,30 @@ llm_semantic = llm.bind_tools(TOOLS_SEMANTIC)
 
 def route_query(state: AgentState) -> AgentState:
     """
-    Router node: classifies the query intent using embedding cosine-similarity
-    and stores the result in state so all downstream nodes can branch on it.
-    Also generates a unique session_id for reasoning trace persistence.
-    """
-    from .hierarchical_router import _classify_intent as _ci_raw
-    query = state["query"]
-    session_id = str(uuid.uuid4())
+    Router node: classifies the query intent using embedding cosine-similarity.
 
-    # Run the router and capture scores for the routing_explanation field.
-    # _classify_intent already prints scores; we reconstruct the explanation here.
-    from sentence_transformers import SentenceTransformer
-    from sentence_transformers.util import cos_sim
-    from .hierarchical_router import (
-        _get_embed_model, _get_proto_embeddings,
-        _FULL_ANALYSIS_PROTOTYPES, _SEMANTIC_LOOKUP_PROTOTYPES,
-    )
-    model = _get_embed_model()
+    If `route` is already set in the incoming state (pre-seeded by the caller),
+    the embedding model is not loaded — this avoids a SIGSEGV caused by loading
+    sentence-transformers after ChatOpenAI's C-extensions are initialised in the
+    same process.  Used by the eval harness which pre-computes routes via L1.
+    """
+    if state.get("route"):
+        # Route pre-seeded — skip cosine similarity, just stamp session metadata.
+        return {
+            "session_id": state.get("session_id") or str(uuid.uuid4()),
+            "routing_explanation": f"Pre-seeded route: {state['route']}",
+            "reasoning_steps": [],
+            "contradictions": [],
+        }
+
+    from .hierarchical_router import _embed, _max_cos_sim, _get_proto_embeddings
+
+    query  = state["query"]
     protos = _get_proto_embeddings()
-    q_emb = model.encode(query, convert_to_tensor=True)
-    full_score   = float(cos_sim(q_emb, protos["full_analysis"]).max().item())
-    sem_score    = float(cos_sim(q_emb, protos["semantic_lookup"]).max().item())
-    route        = "full_analysis" if full_score >= sem_score else "semantic_lookup"
+    q_vec  = _embed([query])[0]
+    full_score = _max_cos_sim(q_vec, protos["full_analysis"])
+    sem_score  = _max_cos_sim(q_vec, protos["semantic_lookup"])
+    route      = "full_analysis" if full_score >= sem_score else "semantic_lookup"
     routing_explanation = (
         f"Routed to {route} "
         f"(full_analysis score={full_score:.3f}, semantic_lookup score={sem_score:.3f}). "
@@ -471,10 +702,11 @@ def route_query(state: AgentState) -> AgentState:
 
     return {
         "route": route,
-        "session_id": session_id,
+        "session_id": str(uuid.uuid4()),
         "routing_explanation": routing_explanation,
         "reasoning_steps": [],
         "contradictions": [],
+        "plan_key": "",
     }
 
 
@@ -483,18 +715,22 @@ def planner_node(state: AgentState) -> AgentState:
     Planner node: selects a deterministic investigation plan from
     _PLAN_TEMPLATES using keyword matching on the query.
 
-    This is the symbolic planning layer — no LLM is called here.
-    The plan is always the same for the same query type, making it
-    fully auditable and reproducible.
+    If `plan_key` is already set in the incoming state (pre-seeded), the
+    keyword matching is skipped and the stored plan_key is used directly.
 
     Only activated for 'full_analysis' queries.
     """
     if state.get("route") != "full_analysis":
-        return {"plan": ""}
+        return {"plan": "", "plan_key": ""}
 
-    plan = _select_plan(state["query"])
-    print(f"\n📋 Analysis Plan (symbolic):\n{plan}\n")
-    return {"plan": plan}
+    if state.get("plan_key"):
+        # Plan pre-seeded by caller — reconstruct plan text from key.
+        plan = _PLAN_TEMPLATES.get(state["plan_key"], {}).get("plan", _DEFAULT_PLAN)
+        return {"plan": plan}
+
+    plan, plan_key = _select_plan(state["query"])
+    print(f"\nAnalysis Plan (symbolic) [{plan_key}]:\n{plan}\n")
+    return {"plan": plan, "plan_key": plan_key}
 
 
 def initialize(state: AgentState) -> AgentState:
@@ -506,7 +742,11 @@ def initialize(state: AgentState) -> AgentState:
     so the agent knows what steps to follow.
     """
     is_full = state.get("route") == "full_analysis"
-    system_prompt = _SYSTEM_PROMPT_FULL if is_full else _SYSTEM_PROMPT_SEMANTIC
+    if is_full:
+        plan_key = state.get("plan_key") or "default"
+        system_prompt = _build_plan_system_prompt(plan_key)
+    else:
+        system_prompt = _SYSTEM_PROMPT_SEMANTIC
 
     plan = state.get("plan", "")
     if plan:
@@ -526,12 +766,21 @@ def initialize(state: AgentState) -> AgentState:
 def agent_node(state: AgentState) -> AgentState:
     """
     Core reasoning node.
-    Selects the tool-bound LLM that matches the pre-computed route, then
-    invokes it against the full message history.  The LLM either:
-      (a) emits a tool_call  → LangGraph routes to the tools node, loops back
-      (b) emits plain text   → tools_condition routes to 'finalize'
+
+    For semantic_lookup queries: binds only search_semantic_events + search_entity_profiles.
+    For full_analysis queries: binds only the 3–6 tools relevant to the plan_key
+      selected by the symbolic planner.  Falling back to the full 20-tool binding
+      only when no plan_key is available.
+
+    Narrowing the tool set makes correct tool selection tractable for smaller
+    LLMs — the model chooses from 3–6 options instead of 20.
     """
-    llm_to_use = llm_full if state.get("route") == "full_analysis" else llm_semantic
+    route = state.get("route")
+    if route != "full_analysis":
+        llm_to_use = llm_semantic
+    else:
+        plan_key = state.get("plan_key", "")
+        llm_to_use = _get_plan_llm(plan_key) if plan_key else llm_full
     response = llm_to_use.invoke(state["messages"])
     return {"messages": [response]}
 
@@ -576,20 +825,13 @@ def finalize(state: AgentState) -> AgentState:
     except Exception:
         pass  # non-fatal — trace persistence is best-effort
 
-    # Append routing and session metadata to summary
-    routing_note = state.get("routing_explanation", "")
     summary = last.content
-    summary += (
-        f"\n\n---\n"
-        f"[Analysis mode: {state.get('route', 'unknown').upper()}] "
-        f"[Session ID: {session_id}] "
-        f"[Tools called: {step_num}]\n"
-        f"[Routing: {routing_note}]"
-    )
 
     return {
         "final_summary": summary,
         "reasoning_steps": steps,
+        "route": state.get("route", "unknown"),
+        "session_id": session_id,
     }
 
 
@@ -603,6 +845,29 @@ _SMOOTH_KEYWORDS = frozenset({
     "calm", "typical", "regular", "undisturbed",
 })
 
+# If any of these appear in a semantic result chunk, that chunk describes an
+# incident — smooth-keyword hits inside it are not "normal traffic" signals.
+_INCIDENT_KEYWORDS = frozenset({
+    "collision", "accident", "crash", "rear-end", "rear_end",
+    "emergency", "tailgating", "speeding", "violation", "hard_braking",
+    "wrong_way", "near-miss", "near_miss", "wreck", "impact",
+})
+
+
+def _strip_incident_sentences(text: str) -> str:
+    """
+    Remove sentences that contain incident keywords so smooth-keyword matching
+    only fires on genuinely calm descriptions, not on incident summaries that
+    happen to use words like 'normal speed' or 'steady approach'.
+    """
+    import re
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    clean = [
+        s for s in sentences
+        if not any(kw in s.lower() for kw in _INCIDENT_KEYWORDS)
+    ]
+    return " ".join(clean)
+
 
 def contradiction_check(state: AgentState) -> AgentState:
     """
@@ -610,9 +875,15 @@ def contradiction_check(state: AgentState) -> AgentState:
 
     A contradiction is flagged when:
       - A semantic tool (search_semantic_events / search_entity_profiles) returned
-        descriptions containing 'normal', 'smooth', 'clear' etc., AND
+        descriptions containing 'normal', 'smooth', 'clear' etc. in non-incident
+        sentences, AND
       - The rule engine (evaluate_traffic_rules) returned actual violations in
         the same session.
+
+    Incident descriptions (containing 'collision', 'accident', 'speeding' etc.)
+    are excluded from the smooth-keyword scan to prevent false positives where
+    an entity profile describes a crash vehicle as having "caused normal traffic
+    disruption" or similar phrasing.
 
     If contradictions are found they are appended to final_summary so the
     user is explicitly warned that the neural and symbolic layers disagreed.
@@ -632,10 +903,12 @@ def contradiction_check(state: AgentState) -> AgentState:
             if name:
                 tool_results.setdefault(name, []).append(str(msg.content))
 
-    semantic_text = " ".join(
+    # Only flag smooth keywords in non-incident context.
+    raw_semantic = " ".join(
         tool_results.get("search_semantic_events", []) +
         tool_results.get("search_entity_profiles", [])
-    ).lower()
+    )
+    semantic_text = _strip_incident_sentences(raw_semantic).lower()
 
     rule_text = " ".join(tool_results.get("evaluate_traffic_rules", [])).lower()
 
@@ -656,13 +929,10 @@ def contradiction_check(state: AgentState) -> AgentState:
             f"The VLM may have missed the event or described a different time window."
         )
 
-    # Append contradiction warnings to final_summary if any were found
-    summary = state.get("final_summary", "")
-    if contradictions:
-        warning = "\n\n⚠ CONTRADICTION DETECTED:\n" + "\n".join(f"  • {c}" for c in contradictions)
-        summary = summary + warning
-
-    return {"contradictions": contradictions, "final_summary": summary}
+    return {
+        "contradictions": contradictions,
+        "final_summary": state.get("final_summary", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -709,10 +979,12 @@ workflow.add_edge("finalize", "contradiction_check")
 workflow.add_edge("contradiction_check", END)
 
 # recursion_limit caps the agent ↔ tools loop.
-# 5 tools × worst-case 5 retries = 25; 30 gives a small safety margin.
+# Each tool call = 2 LangGraph steps (agent → tool → agent).
+# Hard/incident plans call up to 11 tools = 22+ steps; 50 gives headroom
+# for retries and finalize/contradiction_check nodes.
 #
 # IMPORTANT: pass the config dict at invoke time, not via .config attribute.
 # The .config attribute approach is not supported in all LangGraph versions.
 # Callers must use: agent_app.invoke(state, config=AGENT_INVOKE_CONFIG)
-AGENT_INVOKE_CONFIG: dict = {"recursion_limit": 30}
+AGENT_INVOKE_CONFIG: dict = {"recursion_limit": 50}
 agent_app = workflow.compile()

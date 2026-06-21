@@ -299,6 +299,9 @@ class ZoneManager:
         self.config = config
         self._prev_positions: Dict[int, Tuple[float, float]] = {}
         self._vehicle_state: Dict[int, _VehicleZoneState] = {}
+        # Last known real-world position per track — used as fallback when
+        # the current frame's real_coords is absent (Kalman reset / gap-fill).
+        self._last_real_pos: Dict[int, Tuple[float, float]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -339,7 +342,12 @@ class ZoneManager:
             curr_positions[tid] = ((x1 + x2) / 2.0, y2)
 
         for tid, curr_pos in curr_positions.items():
-            real_pos = real_coords.get(tid, (0.0, 0.0))
+            # Update last-known real position when available; fall back to the
+            # previous frame's value rather than the origin (0, 0) which would
+            # corrupt crossing event world coordinates during Kalman gap-fills.
+            if tid in real_coords:
+                self._last_real_pos[tid] = real_coords[tid]
+            real_pos = self._last_real_pos.get(tid, (0.0, 0.0))
 
             # ── First appearance ──────────────────────────────────────────
             if tid not in self._vehicle_state:

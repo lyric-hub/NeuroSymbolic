@@ -4,17 +4,20 @@ import time
 import json
 import threading
 import queue as queue_module
+import math
 from collections import deque
 from pathlib import Path
 from PIL import Image
 import numpy as np
 
 # --- Phase 1: Physics Engine Imports ---
-from src.physics_engine.detector import load_detector
+from src.physics_engine.detector import load_pose_detector
 from src.physics_engine.tracker import VehicleTracker
 from src.physics_engine.homography import CoordinateTransformer
 from src.physics_engine.kinematics import KinematicEstimator
 from src.physics_engine.zone_manager import ZoneManager, ZoneConfig
+from src.physics_engine.zone_blur import build_entry_buffer, apply_detection_blur
+from src.physics_engine.lane_classifier import LaneClassifier
 
 # --- Phase 3: Hybrid Database Imports ---
 from src.memory_layer.duckdb_client import DuckDBClient
@@ -25,17 +28,7 @@ from src.agentic_orchestrator.sequential_pipeline import agent_app, AGENT_INVOKE
 log = logging.getLogger(__name__)
 
 SOM_BUFFER_SIZE = 6
-
-# YOLO COCO class IDs → human-readable vehicle labels.
-# Only vehicle classes relevant to traffic analysis are listed.
-YOLO_CLASS_NAMES: dict = {
-    0: "person",
-    1: "bicycle",
-    2: "car",
-    3: "motorcycle",
-    5: "bus",
-    7: "truck",
-}
+TARGET_PHYSICS_FPS = 20.0
 
 
 def _vlm_worker(
@@ -52,15 +45,15 @@ def _vlm_worker(
          timestamp, frame_id, vehicle_first_seen, behavior_summary)
     A sentinel value of None signals the worker to shut down cleanly.
     """
-    from src.semantic_abstractor.set_of_mark import AdaptiveRenderer, RenderContext, draw_zone_overlay
+    from src.semantic_abstractor.set_of_mark import VehicleIdRenderer, RenderContext, draw_zone_overlay
     from src.semantic_abstractor.vlm_inference import TrafficSemanticAbstractor
     from src.semantic_abstractor.entity_extractor import EntityExtractor
     from src.memory_layer.milvus_client import SemanticVectorStore
     from src.memory_layer.graph_client import GraphClient
 
-    renderer = AdaptiveRenderer()
+    renderer = VehicleIdRenderer()
     vlm = TrafficSemanticAbstractor(model_id="gemma4:e2b")
-    extractor = EntityExtractor(model_name="qwen2.5:72b")
+    extractor = EntityExtractor(model_name="gemma4:e2b")
     milvus_client = SemanticVectorStore()
     graph_client = GraphClient()
 
@@ -216,7 +209,7 @@ def process_video(
     progress_callback=None,
     run_physics: bool = True,
     run_vlm: bool = True,
-    model_path: str = "yolov8n.pt",
+    model_path: str = "models/yolo_pose-4/weights/best.pt",
 ):
     """
     Executes the dual-loop Neuro-Symbolic tracking and abstraction pipeline.
@@ -237,18 +230,33 @@ def process_video(
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
 
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # Run VLM ~3 times per second regardless of source frame rate.
-    semantic_interval = max(1, fps // 3)
-    log.info("Video: %d fps | %d frames | VLM every %d frames (~3/sec)",
-             fps, total_frames, semantic_interval)
+
+    # Recorded-video mode: keep timestamps in source-video time but subsample
+    # aggressively enough that metre-scale projection jitter does not explode
+    # into unrealistic speeds. For 100 FPS input this yields FRAME_STEP=5
+    # (about 20 Hz physics), which is a better match for traffic motion.
+    FRAME_STEP: int = max(1, int(math.ceil(fps / TARGET_PHYSICS_FPS)))
+    physics_fps: float = fps / FRAME_STEP
+
+    # Run VLM ~3 times per second of video, counted in processed frames.
+    semantic_interval = max(1, int(physics_fps) // 3)
+    log.info(
+        "Video: %.2f fps | %d frames | FRAME_STEP=%d → physics at %.2f fps"
+        " | VLM every %d processed frames (~3/sec)",
+        fps, total_frames, FRAME_STEP, physics_fps, semantic_interval,
+    )
 
     # 2. Initialize Databases (DuckDB always; Milvus/Graph handled in VLM worker thread)
     duckdb_client = DuckDBClient()
 
     # 3. Initialize Physics Engine (Micro-Loop) with correct fps
-    detector = load_detector(model_path, conf=0.3)
+    detector = load_pose_detector(model_path, conf=0.3)
+    # Use the class names baked into the model checkpoint — avoids the COCO
+    # mismatch when a custom-trained pose model has non-COCO class indices.
+    _class_names: dict = detector.model.names
+    log.info("Model class map: %s", _class_names)
     tracker = VehicleTracker(tracker_name="bytetrack")
     if run_physics:
         transformer = CoordinateTransformer("calibration.yaml")
@@ -268,7 +276,17 @@ def process_video(
             pass  # fall back to 30
         log.info("KinematicEstimator max_missed_frames aligned to ByteTrack track_buffer=%d", _bt_missed)
 
-        kinematics = KinematicEstimator(fps=float(fps), max_missed_frames=_bt_missed)
+        kinematics = KinematicEstimator(
+            fps=physics_fps,
+            max_missed_frames=_bt_missed,
+            frame_step=FRAME_STEP,
+            speed_window_s=0.25,
+            accel_window_s=0.5,
+            min_trusted_samples=5,
+            max_speed_kmh=140.0,
+            max_pos_accel_kmhps=25.0,
+            max_brake_kmhps=35.0,
+        )
         duckdb_client.set_named_points(transformer.named_points, transformer.reference_name)
         log.info(
             "Reference point: '%s' | Named landmarks: %s",
@@ -292,12 +310,34 @@ def process_video(
     # Zone manager is optional — only active when zone_config.json exists.
     # Draw zones at /zone-ui before running the pipeline.
     zone_manager = None
-    zone_config = None
+    zone_config  = None
+    _entry_buffer: np.ndarray | None = None
     if Path("zone_config.json").exists():
         zone_config = ZoneConfig.from_json("zone_config.json")
         zone_manager = ZoneManager(zone_config)
         log.info("Zone '%s' active — gates: %s",
                  zone_config.zone_id, [g.name for g in zone_config.gates])
+        # Pre-compute the 5 m entry buffer in pixel space once at startup.
+        # Used every frame to extend the unblurred region upstream of E1.
+        if run_physics:
+            _entry_buffer = build_entry_buffer(
+                transformer.H,
+                transformer.named_points,
+                extension_m=5.0,
+            )
+            if _entry_buffer is not None:
+                log.info("Entry buffer built: 5 m upstream of C0/C6 gate")
+
+    # Lane classifier — loaded from lane_config.json when available.
+    # Run the setup script (or call LaneClassifier.from_frame()) once to
+    # generate the config.  When absent, lane index is not stored.
+    lane_classifier: LaneClassifier | None = None
+    if Path("lane_config.json").exists():
+        lane_classifier = LaneClassifier.load("lane_config.json")
+        log.info(
+            "LaneClassifier loaded: %d lanes, boundaries=%s",
+            lane_classifier.n_lanes(), lane_classifier.boundaries,
+        )
 
     # 4. Start VLM worker thread (Macro-Loop runs in background)
     if run_vlm:
@@ -316,7 +356,8 @@ def process_video(
         _vlm_thread.start()
         log.info("VLM worker thread started — macro-loop running in background.")
 
-    frame_id = 0
+    frame_id = 0          # actual video frame index (increments by FRAME_STEP)
+    processed = 0         # count of frames sent through YOLO
     start_time = time.time()
     log.info("--- Starting Video Processing ---")
     while cap.isOpened():
@@ -324,26 +365,70 @@ def process_video(
         if not ret:
             break
 
-        timestamp = frame_id / fps
+        # Skip intermediate frames cheaply — no decode, just advance the
+        # demuxer. frame_id stays aligned to the actual video timeline so
+        # timestamps remain correct for DuckDB and the kinematic estimator.
+        # Track how many grabs succeeded so frame_id is exact at end-of-file.
+        grabbed = 0
+        for _ in range(FRAME_STEP - 1):
+            if not cap.grab():
+                break
+            grabbed += 1
+
+        timestamp = frame_id / fps   # video wall-clock time in seconds
 
         # ==========================================
         # THE MICRO-LOOP (High-Frequency Physics)
         # ==========================================
 
         # 1. Detect & Track (always — tracker feeds both physics and VLM)
-        raw_dets = detector.predict(frame)
-        tracked_boxes = tracker.update(raw_dets[0], frame)
+        # Blur everything outside the zone + 5 m entry buffer so YOLO
+        # focuses on the measurement corridor and incoming vehicles.
+        # The original frame is kept for VLM and video output.
+        detect_frame = (
+            apply_detection_blur(
+                frame,
+                zone_config.polygon if zone_config is not None else None,
+                _entry_buffer,
+            )
+            if zone_manager is not None
+            else frame
+        )
+        pose_result, keypoints_np = detector.predict_with_pose(detect_frame)
+        tracked_boxes = tracker.update(pose_result, frame)
 
         # 2-7. Physics sub-loop — kinematics, DuckDB, alerts, zones
         if run_physics:
-            real_coords = transformer.get_real_world_coords(tracked_boxes)
-            state_vectors, synthetic_rows = kinematics.update(
-                real_coords, timestamp, frame_id
+            # Pass raw pose bboxes + keypoints so the transformer can use kp31
+            # (rear wheel bottom, z=0) instead of bbox bottom-centre.
+            pose_boxes_np = (
+                pose_result.boxes.data.cpu().numpy()
+                if pose_result.boxes is not None and len(pose_result.boxes) > 0
+                else np.empty((0, 6), dtype=np.float32)
             )
+            real_coords, _ = transformer.get_real_world_coords(
+                tracked_boxes,
+                pose_detections=(pose_boxes_np, keypoints_np),
+            )
+            measurement_quality = dict(transformer.last_measurement_quality)
+            state_vectors, synthetic_rows = kinematics.update(
+                real_coords, timestamp, frame_id, measurement_quality
+            )
+            state_quality = dict(kinematics.last_state_quality)
+            transformer.update_velocity_cache(state_vectors)
             class_labels = {
-                int(t[4]): YOLO_CLASS_NAMES.get(int(t[6]), "unknown")
+                int(t[4]): _class_names.get(int(t[6]), "unknown")
                 for t in tracked_boxes
             }
+
+            # Lane classification — appended to class_label as
+            # "<vehicle_type>:lane<N>" so DuckDB queries can filter by lane.
+            if lane_classifier is not None:
+                for tid, (_, world_y) in real_coords.items():
+                    lane_idx = lane_classifier.classify(world_y)
+                    class_labels[tid] = (
+                        f"{class_labels.get(tid, 'unknown')}:lane{lane_idx}"
+                    )
             # Column 5 of tracked_boxes is the YOLO detection confidence (0–1).
             # Stored in DuckDB so data quality reports can compute mean confidence
             # per vehicle/window and flag low-confidence analyses.
@@ -352,7 +437,8 @@ def process_video(
                 for t in tracked_boxes
             }
             duckdb_client.insert_state_vectors(
-                timestamp, frame_id, state_vectors, class_labels, detection_confidences
+                timestamp, frame_id, state_vectors, class_labels,
+                detection_confidences, state_quality,
             )
             # Write gap-filled synthetic rows (interpolated=True) so DuckDB has
             # a continuous time-series with no holes from missed detections.
@@ -378,6 +464,7 @@ def process_video(
         else:
             real_coords = {}
             state_vectors = {}
+            state_quality = {}
 
         # Motion-energy score (cheap, runs every frame — used by VLM gate)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -395,9 +482,9 @@ def process_video(
         #   - Fixed interval: every semantic_interval frames (~3/sec)
         #   - Motion-energy gate: skip static scenes (saves ~40-60% VLM calls)
         _run_macro = (
-            frame_id > 0
+            processed > 0
             and len(tracked_boxes) > 0
-            and frame_id % semantic_interval == 0
+            and processed % semantic_interval == 0
             and _motion_score >= MOTION_SKIP_THRESHOLD
         )
 
@@ -422,7 +509,10 @@ def process_video(
                 frame.copy(),
                 list(tracked_boxes),
                 dict(state_vectors),
-                frozenset(kinematics.warm_tracks) if run_physics else frozenset(),
+                frozenset(
+                    tid for tid, q in state_quality.items()
+                    if q.get("track_warm") and q.get("trusted_for_rules")
+                ) if run_physics else frozenset(),
                 timestamp,
                 frame_id,
                 dict(_vehicle_first_seen),
@@ -439,10 +529,11 @@ def process_video(
                 log.debug("[%.1fs] VLM queue full — dropping frame %d",
                           timestamp, frame_id)
 
+        processed += 1
         if progress_callback is not None:
             progress_callback(frame_id, total_frames)
 
-        frame_id += 1
+        frame_id += 1 + grabbed
 
     cap.release()
     log.info("--- Video Processing Complete in %.2fs ---", time.time() - start_time)

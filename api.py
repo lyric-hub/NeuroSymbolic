@@ -112,6 +112,10 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     query: str
     summary: str
+    reasoning_steps: list = []
+    route: str = ""
+    session_id: str = ""
+    contradictions: list = []
 
 class JobResponse(BaseModel):
     job_id: str
@@ -245,7 +249,15 @@ async def chat_with_agent(request: ChatRequest):
         )
 
         summary = final_state.get("final_summary", "No summary generated.")
-        return ChatResponse(query=request.query, summary=summary)
+        steps   = final_state.get("reasoning_steps", [])
+        return ChatResponse(
+            query=request.query,
+            summary=summary,
+            reasoning_steps=steps,
+            route=final_state.get("route", ""),
+            session_id=final_state.get("session_id", ""),
+            contradictions=final_state.get("contradictions", []),
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -395,6 +407,60 @@ async def list_videos():
 async def health_check():
     """Simple check to see if the API is alive."""
     return {"status": "healthy", "system": "Neuro-Symbolic Agentic Brain"}
+
+
+@app.get("/stats/")
+async def get_db_stats():
+    """
+    Returns row/event counts from all three memory layers for the dashboard.
+    All queries are read-only and run synchronously in a thread pool worker.
+    """
+    import threading
+
+    result: dict = {
+        "duckdb_rows": 0,
+        "milvus_events": 0,
+        "milvus_profiles": 0,
+        "kuzu_nodes": 0,
+        "kuzu_edges": 0,
+        "error": None,
+    }
+
+    def _query():
+        try:
+            from src.memory_layer.duckdb_client import DuckDBClient
+            db = DuckDBClient()
+            rows = db.conn.execute(
+                "SELECT COUNT(*) FROM vehicle_trajectories"
+            ).fetchone()
+            result["duckdb_rows"] = int(rows[0]) if rows else 0
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        try:
+            from src.memory_layer.milvus_client import SemanticVectorStore
+            store = SemanticVectorStore()
+            ev_stats = store.client.get_collection_stats("traffic_events")
+            pr_stats = store.client.get_collection_stats("entity_profiles")
+            result["milvus_events"]   = int(ev_stats.get("row_count", 0))
+            result["milvus_profiles"] = int(pr_stats.get("row_count", 0))
+            store.close()
+        except Exception:
+            pass
+
+        try:
+            import kuzu
+            db_kuzu = kuzu.Database("data/graph_storage/traffic_graph")
+            conn = kuzu.Connection(db_kuzu)
+            n = conn.execute("MATCH (n) RETURN COUNT(n)").get_next()[0]
+            e = conn.execute("MATCH ()-[r]->() RETURN COUNT(r)").get_next()[0]
+            result["kuzu_nodes"] = int(n)
+            result["kuzu_edges"] = int(e)
+        except Exception:
+            pass
+
+    await asyncio.to_thread(_query)
+    return result
 
 # --- Serve Frontend ---
 # Must be AFTER all API routes to avoid catching API paths

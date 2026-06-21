@@ -1,10 +1,14 @@
 import logging
+import os
 from pathlib import Path
 from typing import List, Dict, Any
+
 from pymilvus import MilvusClient
-from sentence_transformers import SentenceTransformer
 
 log = logging.getLogger(__name__)
+
+_EMBED_PROVIDER = os.environ.get("AGENT_LLM_PROVIDER", "openai")
+_EMBED_MODEL    = os.environ.get("AGENT_EMBED_MODEL", "all-minilm")
 
 # Collection names
 _EVENTS_COLLECTION   = "traffic_events"    # frame-level VLM event descriptions
@@ -25,9 +29,11 @@ class SemanticVectorStore:
         e.g. "Vehicle 4: mostly speeding, hard-braked near intersection at 10s."
         Enables: "which vehicle was most aggressive throughout the video?"
 
-    Both collections use all-MiniLM-L6-v2 (dim=384) for consistent
-    embedding space — queries against either collection use the same
-    encoder.
+    Embedding back-end is provider-switchable via AGENT_LLM_PROVIDER:
+      - "ollama"  → Ollama HTTP API (all-minilm, no local PyTorch loaded)
+      - default   → sentence-transformers all-MiniLM-L6-v2 (lazy-loaded)
+
+    Both paths produce 384-dim vectors in the same embedding space.
     """
 
     def __init__(
@@ -38,18 +44,44 @@ class SemanticVectorStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.client = MilvusClient(db_path)
         self.collection_name = collection_name
-
-        log.info("Loading SentenceTransformer embedding model...")
-        self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.dim = 384
 
-        # Fix 8: cache last-inserted summary per vehicle to suppress duplicate inserts.
-        # upsert_entity_profile is called every macro-loop tick; without this a 5-min
-        # video generates hundreds of identical profile vectors per vehicle.
+        # Sentence-transformers model — loaded lazily only when provider != ollama.
+        self._st_model = None
+
+        # Cache last-inserted summary per vehicle to suppress duplicate inserts.
+        # upsert_entity_profile is called every macro-loop tick; without this a
+        # 5-min video generates hundreds of identical profile vectors per vehicle.
         self._profile_cache: dict = {}
 
         self._initialize_collection()
         self._initialize_entity_profiles()
+
+    # ------------------------------------------------------------------
+    # Embedding back-end
+    # ------------------------------------------------------------------
+
+    def _encode(self, text: str) -> list:
+        """
+        Returns a 384-dim float list for the given text.
+
+        Routes to Ollama HTTP API (no local PyTorch) when
+        AGENT_LLM_PROVIDER=ollama, otherwise uses the local
+        sentence-transformers model (lazy-loaded on first call).
+        """
+        if _EMBED_PROVIDER == "ollama":
+            import ollama as _ollama
+            return _ollama.embeddings(model=_EMBED_MODEL, prompt=text)["embedding"]
+
+        if self._st_model is None:
+            from sentence_transformers import SentenceTransformer
+            log.info("Loading SentenceTransformer embedding model...")
+            self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+        return self._st_model.encode(text).tolist()
+
+    # ------------------------------------------------------------------
+    # Collection initialisation
+    # ------------------------------------------------------------------
 
     def _initialize_collection(self) -> None:
         """Creates the traffic_events collection if it doesn't already exist."""
@@ -71,77 +103,70 @@ class SemanticVectorStore:
                 auto_id=True,
             )
 
+    # ------------------------------------------------------------------
+    # Event-level methods
+    # ------------------------------------------------------------------
+
     def insert_event_chunk(
         self,
         description: str,
         start_time: float,
         end_time: float,
         frame_id: int,
-    ):
+    ) -> None:
         """
-        Embeds and inserts a VLM-generated semantic description into the vector store.
+        Embeds and inserts a VLM-generated semantic description into the
+        vector store.
 
         Args:
-            description: The raw text from the VLM (e.g., "Vehicle 4 tailgating Vehicle 9").
+            description: The raw text from the VLM.
             start_time:  Start of the overlapping time window chunk (seconds).
-            end_time:    End / presentation timestamp of the sampled frame (seconds).
+            end_time:    End / presentation timestamp of the sampled frame (s).
             frame_id:    Integer frame index of the sampled frame.
         """
         if not description.strip():
             return
-
-        # Convert text into a numerical vector embedding
-        embedding = self.embedding_model.encode(description).tolist()
-
-        # Prepare data payload. We store the time window and source frame as metadata
-        # so the Agent can use them as pointers to query the Graph and Time-Series DBs.
-        data = [{
-            "vector": embedding,
-            "text": description,
-            "start_time": start_time,
-            "end_time": end_time,
-            "frame_id": frame_id,
-            "time_window_pointer": f"{start_time:.1f}-{end_time:.1f}",
-        }]
-
-        # Insert the vector and metadata into Milvus Lite
-        self.client.insert(collection_name=self.collection_name, data=data)
+        self.client.insert(
+            collection_name=self.collection_name,
+            data=[{
+                "vector":               self._encode(description),
+                "text":                 description,
+                "start_time":           start_time,
+                "end_time":             end_time,
+                "frame_id":             frame_id,
+                "time_window_pointer":  f"{start_time:.1f}-{end_time:.1f}",
+            }],
+        )
 
     def search_semantic_events(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
-        Tool for the LangGraph Agent: Searches for semantic events using natural language.
-        
+        Searches for semantic events using natural language.
+
         Returns:
-            A list of matching text descriptions and their specific temporal windows.
+            List of matching text descriptions and their temporal windows.
         """
-        # Embed the user's natural language query
-        query_vector = self.embedding_model.encode(query).tolist()
-        
-        # Perform Approximate Nearest Neighbor (ANN) similarity search
         results = self.client.search(
             collection_name=self.collection_name,
-            data=[query_vector],
+            data=[self._encode(query)],
             limit=top_k,
-            output_fields=["text", "start_time", "end_time", "frame_id", "time_window_pointer"],
+            output_fields=["text", "start_time", "end_time", "frame_id",
+                           "time_window_pointer"],
         )
-
-        # Format the output into a clean dictionary list for the LLM agent to read
-        formatted_results = []
+        formatted = []
         for hits in results:
             for hit in hits:
                 entity = hit.get("entity", {})
-                formatted_results.append({
-                    # Fix 1: Milvus returns L2 distance (lower = more similar).
-                    # Convert to a 0–1 similarity score so the agent ranks correctly.
-                    "similarity_score": round(1.0 / (1.0 + hit.get("distance", 1.0)), 4),
-                    "description": entity.get("text"),
-                    "time_window": entity.get("time_window_pointer"),
-                    "frame_id": entity.get("frame_id"),
+                formatted.append({
+                    "similarity_score":         round(
+                        1.0 / (1.0 + hit.get("distance", 1.0)), 4
+                    ),
+                    "description":              entity.get("text"),
+                    "time_window":              entity.get("time_window_pointer"),
+                    "frame_id":                 entity.get("frame_id"),
                     "presentation_timestamp_s": entity.get("end_time"),
                 })
-                
-        return formatted_results
-        
+        return formatted
+
     # ------------------------------------------------------------------
     # Entity profile methods (vehicle-level longitudinal memory)
     # ------------------------------------------------------------------
@@ -156,38 +181,29 @@ class SemanticVectorStore:
         """
         Embeds and stores a longitudinal behavior summary for one vehicle.
 
-        Called in the macro-loop whenever a vehicle's behavior_summary
-        is updated. The profile accumulates over the video: each call
-        appends a new embedding snapshot; retrieval returns the most
-        semantically relevant snapshot for a given query.
-
-        This enables entity-centric queries that event-level search cannot
-        answer — e.g. "which vehicle was most aggressive throughout the
-        entire video?" or "find the vehicle that consistently sped".
+        Called in the macro-loop whenever a vehicle's behavior_summary is
+        updated.  The profile accumulates over the video; retrieval returns
+        the most semantically relevant snapshot for a given query.
 
         Args:
-            track_id:   Integer tracker ID (e.g. 4 for "Vehicle 4").
-            summary:    Natural language longitudinal narrative, e.g.
-                        "Vehicle 4: moving → speeding → hard-braking.
-                         Peak speed 18.2 m/s. Hard braking at t=10.5s."
+            track_id:   Integer tracker ID.
+            summary:    Natural language longitudinal narrative.
             first_seen: Timestamp when the vehicle first appeared (s).
             last_seen:  Timestamp of the most recent observation (s).
         """
         if not summary.strip():
             return
-        # Fix 8: skip insert if summary text hasn't changed since last call for this vehicle.
         if self._profile_cache.get(track_id) == summary:
             return
         self._profile_cache[track_id] = summary
-        embedding = self.embedding_model.encode(summary).tolist()
         self.client.insert(
             collection_name=_PROFILES_COLLECTION,
             data=[{
-                "vector":      embedding,
-                "track_id":    track_id,
-                "summary":     summary,
-                "first_seen":  first_seen,
-                "last_seen":   last_seen,
+                "vector":     self._encode(summary),
+                "track_id":   track_id,
+                "summary":    summary,
+                "first_seen": first_seen,
+                "last_seen":  last_seen,
             }],
         )
 
@@ -199,11 +215,6 @@ class SemanticVectorStore:
         """
         Searches entity_profiles for vehicles matching a behavioral description.
 
-        Enables global behavioral queries such as:
-          - "Which vehicle was speeding the most?"
-          - "Find the vehicle involved in the near-miss."
-          - "Which vehicle behaved most aggressively?"
-
         Args:
             query:  Natural language behavioral description.
             top_k:  Number of results to return.
@@ -212,10 +223,9 @@ class SemanticVectorStore:
             List of dicts with: similarity_score, track_id, summary,
             first_seen, last_seen.
         """
-        query_vector = self.embedding_model.encode(query).tolist()
         results = self.client.search(
             collection_name=_PROFILES_COLLECTION,
-            data=[query_vector],
+            data=[self._encode(query)],
             limit=top_k,
             output_fields=["track_id", "summary", "first_seen", "last_seen"],
         )
@@ -224,8 +234,9 @@ class SemanticVectorStore:
             for hit in hits:
                 entity = hit.get("entity", {})
                 formatted.append({
-                    # Fix 1: same L2→similarity conversion as search_semantic_events.
-                    "similarity_score": round(1.0 / (1.0 + hit.get("distance", 1.0)), 4),
+                    "similarity_score": round(
+                        1.0 / (1.0 + hit.get("distance", 1.0)), 4
+                    ),
                     "track_id":   entity.get("track_id"),
                     "summary":    entity.get("summary"),
                     "first_seen": entity.get("first_seen"),
@@ -233,6 +244,6 @@ class SemanticVectorStore:
                 })
         return formatted
 
-    def close(self):
+    def close(self) -> None:
         """Safely closes the database connection."""
         self.client.close()

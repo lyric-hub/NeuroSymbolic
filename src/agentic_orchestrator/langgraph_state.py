@@ -21,6 +21,11 @@ class AgentState(TypedDict):
     # Storing it here makes the system's reasoning transparent and inspectable.
     plan: str
 
+    # Key of the matched plan template (e.g. "incident", "vehicle_type").
+    # Used by agent_node to bind only the tools relevant to this plan
+    # instead of all 20 — reduces the LLM's decision space to ≤6 tools.
+    plan_key: str
+
     # Growing message history: HumanMessage → AIMessage (with tool_calls) →
     # ToolMessage (tool result) → AIMessage → ...
     # The add_messages reducer appends each new message rather than overwriting.
